@@ -126,6 +126,28 @@ describe('trigger request contract', () => {
     }
   });
 
+  it('accepts a well-formed idempotencyKey', () => {
+    const req = request();
+    req.options = { asyncReturnSessionId: true, idempotencyKey: 'riff-task-fe4d3f7e' };
+    expect(validateTriggerRequest(req).ok).toBe(true);
+  });
+
+  it('rejects an empty / whitespace-only / over-long / non-string idempotencyKey', () => {
+    for (const idempotencyKey of ['', '   ', 'k'.repeat(201), 42, {}]) {
+      const req = request();
+      (req.options as any) = { idempotencyKey };
+      const v = validateTriggerRequest(req);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+    }
+  });
+
+  it('treats an absent idempotencyKey as valid (opt-in field)', () => {
+    const req = request();
+    req.options = { asyncReturnSessionId: true };
+    expect(validateTriggerRequest(req).ok).toBe(true);
+  });
+
   it('builds a prompt that labels event data as untrusted', () => {
     const prompt = buildUntrustedEventPrompt(request(), 'trg_1');
     expect(prompt).toContain('untrusted event data');

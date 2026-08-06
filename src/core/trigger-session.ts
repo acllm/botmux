@@ -1,5 +1,6 @@
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import * as idempotencyStore from '../services/idempotency-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
@@ -388,6 +389,42 @@ export async function triggerSessionTurn(
   const codexAppMessageContext = buildExternalEventDataContext(req, triggerId);
   const promptPreview = prompt.length > 4000 ? prompt.slice(0, 4000) + '\n...[truncated]' : prompt;
 
+  // Idempotency: a caller-supplied options.idempotencyKey makes a retried
+  // /api/trigger (e.g. after a lost HTTP response) return the SAME session +
+  // triggerId instead of creating a new one and re-dispatching — so the turn
+  // can't run twice. Skip on dryRun (a probe must never claim a key). Check
+  // BEFORE any session creation. The key is scoped per bot (larkAppId).
+  const idempotencyKey = req.options?.idempotencyKey?.trim();
+  if (idempotencyKey && !dryRun) {
+    const hit = idempotencyStore.lookup(larkAppId, idempotencyKey);
+    if (hit) {
+      // Only honor the hit if the mapped session still resolves — live in this
+      // registry, OR a durable record exists (session record on disk / persisted
+      // async result). A stale mapping whose session is fully gone falls through
+      // to create a fresh one and RE-CLAIMS the key below (self-healing).
+      const liveHit = activeBySessionId(deps.activeSessions, hit.sessionId);
+      const durable = liveHit
+        || !!sessionStore.getSession(hit.sessionId)
+        || !!asyncTriggerStore.lookup(hit.sessionId);
+      if (durable) {
+        const hitChatId = liveHit?.chatId
+          ?? sessionStore.getSession(hit.sessionId)?.chatId
+          ?? (typeof req.target.chatId === 'string' ? req.target.chatId : '')
+          ?? '';
+        return {
+          ...buildAsyncQueuedResponse(
+            hit.triggerId,
+            hit.sessionId,
+            hitChatId,
+            'idempotency key already served; reusing the existing session (no new dispatch)',
+          ),
+          idempotencyKey,
+          idempotent: true,
+        };
+      }
+    }
+  }
+
   const rootMessageId = typeof req.target.rootMessageId === 'string' ? req.target.rootMessageId.trim() : '';
   let ds = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
   if (req.target.sessionId && !ds) {
@@ -742,6 +779,34 @@ export async function triggerSessionTurn(
   }
   rememberInput(newDs, prompt, promptInput);
 
+  // Idempotency claim: atomically bind this key → the session we just created,
+  // BEFORE dispatch. If a concurrent same-key trigger already won the claim,
+  // `claim` returns THEIR record — abandon ours (close it, no fork) and return
+  // their session so the turn dispatches exactly once. riff serializes retries
+  // of one task, but two near-simultaneous same-key requests must still not
+  // double-run. Skipped on dryRun (handled earlier — dryRun never reaches here).
+  if (idempotencyKey) {
+    const claimed = idempotencyStore.claim(
+      { sessionId: session.sessionId, triggerId, ownerLarkAppId: larkAppId, createdAt: now },
+      idempotencyKey,
+    );
+    if (claimed.sessionId !== session.sessionId) {
+      // Lost the race — someone else's session owns this key. Tear ours down
+      // (never dispatched) and hand back the winner.
+      await closeSession(session.sessionId);
+      return {
+        ...buildAsyncQueuedResponse(
+          claimed.triggerId,
+          claimed.sessionId,
+          chatId,
+          'idempotency key concurrently claimed; reusing the winning session (no new dispatch)',
+        ),
+        idempotencyKey,
+        idempotent: true,
+      };
+    }
+  }
+
   if (req.options?.waitForFinalOutput) {
     return waitForSessionFinalOutput(
       newDs,
@@ -772,12 +837,15 @@ export async function triggerSessionTurn(
     forkWorker(newDs, promptInput, dispatchAttempt === undefined
       ? triggerId
       : { turnId: triggerId, dispatchAttempt });
-    return buildAsyncQueuedResponse(
-      triggerId,
-      session.sessionId,
-      chatId,
-      'queued new session turn; poll by sessionId or triggerId for final output',
-    );
+    return {
+      ...buildAsyncQueuedResponse(
+        triggerId,
+        session.sessionId,
+        chatId,
+        'queued new session turn; poll by sessionId or triggerId for final output',
+      ),
+      ...(idempotencyKey ? { idempotencyKey, idempotent: false } : {}),
+    };
   }
 
   if (stableTurnId) {

@@ -23,8 +23,8 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
-  claim, transition, takeover, lookup, remove, listAll,
-  writeAtomicByPath, removeByPath, IdempotencyConflictError,
+  claim, transition, takeover, lookup, compareAndRemove, listAll, removeByPathLocked,
+  IdempotencyConflictError,
   type IdempotencyRecord,
 } from '../src/services/idempotency-store.js';
 
@@ -94,27 +94,53 @@ describe('transition (CAS)', () => {
   });
 });
 
-describe('takeover (older-boot reserved)', () => {
-  it('replaces an older-boot reserved lease with a fresh one', () => {
+describe('takeover (older-boot reserved) — returns won|existing', () => {
+  it('WON: replaces an older-boot reserved lease with a fresh one', () => {
     const { record } = claim(base({ ownerBootId: 'boot-OLD' })) as { record: IdempotencyRecord };
-    const fresh = takeover({
-      ownerLarkAppId: 'cli_a', key: 'k1', from: record,
+    const res = takeover({
+      ownerLarkAppId: 'cli_a', key: 'k1', expect: record,
       sessionId: 'sess-NEW', triggerId: 'trg_NEW', requestHash: 'sha256:h1',
       ownerBootId: 'boot-NEW', now: 5000,
     });
-    expect(fresh.sessionId).toBe('sess-NEW');
-    expect(fresh.ownerBootId).toBe('boot-NEW');
-    expect(fresh.state).toBe('reserved');
+    expect(res.kind).toBe('won');
+    expect(res.record.sessionId).toBe('sess-NEW');
+    expect(res.record.ownerBootId).toBe('boot-NEW');
+    expect(res.record.state).toBe('reserved');
     expect(lookup('cli_a', 'k1')?.sessionId).toBe('sess-NEW');
   });
 
-  it('refuses takeover if the lease changed under us (revision moved)', () => {
+  it('EXISTING: does NOT seize if the lease advanced to attempting under us', () => {
     const { record } = claim(base({ ownerBootId: 'boot-OLD' })) as { record: IdempotencyRecord };
-    transition('cli_a', 'k1', record, { state: 'attempting', now: 2000 }); // now attempting rev2
-    expect(() => takeover({
-      ownerLarkAppId: 'cli_a', key: 'k1', from: record,
+    transition('cli_a', 'k1', record, { state: 'attempting', now: 2000 }); // rev2 attempting
+    const res = takeover({
+      ownerLarkAppId: 'cli_a', key: 'k1', expect: record, // stale rev1 reserved
       sessionId: 'sess-NEW', triggerId: 'trg_NEW', requestHash: 'sha256:h1', ownerBootId: 'boot-NEW', now: 5000,
-    })).toThrow(/lease changed/);
+    });
+    expect(res.kind).toBe('existing');
+    expect(res.record.state).toBe('attempting');
+    expect(res.record.sessionId).toBe('sess-1'); // original, not seized
+  });
+
+  it('EXISTING: a stale rev1 cannot clobber a fresh winner rev1 (the codex race)', () => {
+    // old claim → remove → fresh winner claim(rev1); takeover(expect=old rev1) must NOT win.
+    const { record: oldRec } = claim(base({ ownerBootId: 'boot-OLD', sessionId: 'sess-OLD' })) as { record: IdempotencyRecord };
+    compareAndRemove('cli_a', 'k1', oldRec);
+    const { record: freshWinner } = claim(base({ ownerBootId: 'boot-FRESH', sessionId: 'sess-FRESH' })) as { record: IdempotencyRecord };
+    expect(freshWinner.revision).toBe(1); // revision restarts from 1
+    const res = takeover({
+      ownerLarkAppId: 'cli_a', key: 'k1', expect: oldRec, // same rev1, but different identity
+      sessionId: 'sess-STALE', triggerId: 'trg_STALE', requestHash: 'sha256:h1', ownerBootId: 'boot-OLD', now: 9000,
+    });
+    expect(res.kind).toBe('existing');
+    expect(lookup('cli_a', 'k1')?.sessionId).toBe('sess-FRESH'); // winner intact
+  });
+
+  it('conflict: takeover with a different payload throws', () => {
+    const { record } = claim(base({ ownerBootId: 'boot-OLD', requestHash: 'sha256:AAA' })) as { record: IdempotencyRecord };
+    expect(() => takeover({
+      ownerLarkAppId: 'cli_a', key: 'k1', expect: record,
+      sessionId: 'sess-NEW', triggerId: 'trg_NEW', requestHash: 'sha256:BBB', ownerBootId: 'boot-NEW', now: 5000,
+    })).toThrow(IdempotencyConflictError);
   });
 });
 
@@ -128,14 +154,12 @@ describe('reconcile enumeration', () => {
     expect(all.every(a => a.file.endsWith('.json'))).toBe(true);
   });
 
-  it('writeAtomicByPath rewrites a lease terminal in place; removeByPath deletes', () => {
-    const { record } = claim(base()) as { record: IdempotencyRecord };
+  it('removeByPathLocked drops a lease by its enumerated path', () => {
+    claim(base());
     const { file } = listAll()[0];
-    writeAtomicByPath(file, { ...record, state: 'terminal', outcome: 'dispatch_unknown', revision: record.revision + 1, updatedAt: 9000 });
-    expect(lookup('cli_a', 'k1')?.state).toBe('terminal');
-    expect(lookup('cli_a', 'k1')?.outcome).toBe('dispatch_unknown');
-    removeByPath(file);
+    removeByPathLocked(file);
     expect(lookup('cli_a', 'k1')).toBeUndefined();
+    expect(() => removeByPathLocked(file)).not.toThrow(); // idempotent
   });
 
   it('listAll skips (does not throw on) a corrupt file', () => {
@@ -147,12 +171,16 @@ describe('reconcile enumeration', () => {
   });
 });
 
-describe('remove + weird keys', () => {
-  it('remove deletes and is idempotent', () => {
-    claim(base());
-    remove('cli_a', 'k1');
+describe('compareAndRemove + weird keys', () => {
+  it('compareAndRemove deletes only the exact expected lease; idempotent', () => {
+    const { record } = claim(base()) as { record: IdempotencyRecord };
+    // Stale expectation (wrong revision) → no-op.
+    expect(compareAndRemove('cli_a', 'k1', { ...record, revision: 99 })).toBe(false);
+    expect(lookup('cli_a', 'k1')).toBeDefined();
+    // Exact match → removed.
+    expect(compareAndRemove('cli_a', 'k1', record)).toBe(true);
     expect(lookup('cli_a', 'k1')).toBeUndefined();
-    expect(() => remove('cli_a', 'k1')).not.toThrow();
+    expect(compareAndRemove('cli_a', 'k1', record)).toBe(false); // already gone
   });
 
   it('tolerates path-traversal / NUL key bytes via hashed filename', () => {

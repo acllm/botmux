@@ -173,8 +173,11 @@ type IdempotencyHitDecision =
   | { kind: 'terminal'; chatId: string; message: string }
   | { kind: 'takeover' };
 
-/** Decide what a same-payload idempotency-key HIT means, per the lease state
- *  machine (at-most-once). Exported for unit tests. */
+/** Decide what a same-payload idempotency-key HIT means (at-most-once). The
+ *  TERMINAL outcome is owned by async-trigger-store (completed / failed), not by
+ *  the lease — so a durable failed (dispatch_unknown) or completed is checked
+ *  FIRST and wins over any lease state. The lease only distinguishes "in flight
+ *  / reserved by me" (reuse) from "older-boot reserved" (takeover). Exported for tests. */
 export function resolveIdempotencyHit(
   hit: idempotencyStore.IdempotencyRecord,
   ownerBootId: string,
@@ -182,18 +185,22 @@ export function resolveIdempotencyHit(
 ): IdempotencyHitDecision {
   const live = activeBySessionId(activeSessions, hit.sessionId);
   const chatId = live?.chatId ?? sessionStore.getSession(hit.sessionId)?.chatId ?? '';
-  const completed = asyncTriggerStore.lookup(hit.sessionId, hit.triggerId)?.result.status === 'completed';
-  if (completed) {
+  const outcome = asyncTriggerStore.lookup(hit.sessionId, hit.triggerId)?.result.status;
+  // Durable terminal evidence wins over lease state (completed > failed).
+  if (outcome === 'completed') {
     return { kind: 'reuse', chatId, message: 'idempotency key already completed; reuse the session (poll trigger-result)' };
   }
-  if (hit.state === 'terminal') {
+  if (outcome === 'failed') {
     return { kind: 'terminal', chatId, message: 'previous dispatch outcome is unknown (ambiguous crash); not re-run (at-most-once)' };
   }
   if (hit.state === 'attempting') {
     if (hit.ownerBootId === ownerBootId || live) {
+      // Owner still advancing, or a live worker is genuinely running the turn.
       return { kind: 'reuse', chatId, message: 'idempotency key in flight; reuse the session (poll trigger-result)' };
     }
-    // Owning boot gone, no live worker, no completion proof → ambiguous.
+    // attempting by a dead boot with NO terminal evidence yet: the reconcile
+    // (or the poll-side resolver) will terminalize it; treat as terminal here so
+    // a retry never re-dispatches. Boot reconcile writes the durable failed.
     return { kind: 'terminal', chatId, message: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)' };
   }
   // reserved
@@ -204,52 +211,57 @@ export function resolveIdempotencyHit(
 }
 
 /**
- * Boot reconcile for idempotency leases (at-most-once convergence). Runs ONCE at
- * daemon startup, after restoreActiveSessions and BEFORE the IPC server accepts
- * requests, so it is single-threaded (no CAS needed). For each stored lease:
- *   - completed (async-trigger store proves final_output landed) → keep as-is;
- *     a retry reuses it and polls the completed result.
- *   - attempting (commit-unknown, owning boot is gone) → terminal
- *     `dispatch_unknown` + close the orphaned session, so trigger-result
- *     converges to `failed` instead of hanging `running` forever. NEVER
- *     re-dispatched (forkWorker returning was not proof the CLI didn't run).
- *   - reserved (provably pre-dispatch — attempting is written before any side
- *     effect) → delete the lease + close the never-dispatched worker-less
- *     session, so a same-key retry can safely start a fresh run.
- *
- * All lease bootIds are from a previous process (this is boot), so there is no
- * "current boot still advancing" case to protect.
+ * Boot reconcile for idempotency leases (at-most-once convergence). MUST run
+ * after the session store + worker pool are initialized but BEFORE the IPC
+ * server binds, and is scoped to a SINGLE owning bot (`ownerLarkAppId`) — the
+ * dataDir is shared across bots, so a bot must never touch another's leases.
+ * For each of THIS owner's leases left by a PREVIOUS boot:
+ *   - completed (async store proves it) → keep; a retry polls the completed result.
+ *   - attempting (commit-unknown, previous boot gone) → write a durable
+ *     `dispatch_unknown` FAILED into async-trigger-store (authoritative terminal,
+ *     so trigger-result converges to `failed` regardless of session close), then
+ *     best-effort close the orphan. NEVER re-dispatched.
+ *   - reserved (provably pre-dispatch) → CAS-remove the lease + best-effort close
+ *     the never-dispatched session, so a same-key retry starts fresh.
+ * Returns the set of sessionIds terminalized/closed here so the caller can
+ * quarantine them from re-attach in restoreActiveSessions.
  */
 export async function reconcileIdempotencyLeasesOnBoot(
-  activeSessions: Map<string, DaemonSession>,
-): Promise<void> {
+  ownerLarkAppId: string,
+  currentBootId: string,
+  getSession: (id: string) => { chatId?: string } | undefined = sessionStore.getSession,
+): Promise<Set<string>> {
   const now = Date.now();
+  const quarantined = new Set<string>();
   for (const { file, record } of idempotencyStore.listAll()) {
     try {
-      const completed = asyncTriggerStore.lookup(record.sessionId, record.triggerId)?.result.status === 'completed';
-      if (completed) continue; // terminal-good; retry reuses + polls
-      if (record.state === 'terminal') continue; // already converged
+      // Owner scoping (fail-closed) + skip current boot's own in-flight leases.
+      if (record.ownerLarkAppId !== ownerLarkAppId) continue;
+      if (record.ownerBootId === currentBootId) continue;
+      const outcome = asyncTriggerStore.lookup(record.sessionId, record.triggerId)?.result.status;
+      if (outcome === 'completed' || outcome === 'failed') continue; // already converged
       if (record.state === 'attempting') {
-        // Ambiguous crash: mark terminal so polling stops, close the orphan.
-        idempotencyStore.writeAtomicByPath(file, {
-          ...record, state: 'terminal', outcome: 'dispatch_unknown', revision: record.revision + 1, updatedAt: now,
-        });
-        if (activeBySessionId(activeSessions, record.sessionId) || sessionStore.getSession(record.sessionId)) {
-          try { await closeSession(record.sessionId); } catch { /* best-effort */ }
+        // Authoritative terminal FIRST (throws on failure → surfaced to caller,
+        // which fails boot readiness rather than silently leaving `running`).
+        asyncTriggerStore.recordFailedStrict(record.sessionId, record.triggerId, now, ownerLarkAppId, 'dispatch_unknown');
+        quarantined.add(record.sessionId);
+        if (getSession(record.sessionId)) {
+          try { await closeSession(record.sessionId); } catch (e) { logger.warn(`[idempotency] reconcile close ${record.sessionId} failed (terminal already durable): ${(e as Error).message}`); }
         }
         continue;
       }
-      // reserved: never dispatched → drop the lease, close the empty session.
-      idempotencyStore.removeByPath(file);
-      if (activeBySessionId(activeSessions, record.sessionId) || sessionStore.getSession(record.sessionId)) {
-        try { await closeSession(record.sessionId); } catch { /* best-effort */ }
+      // reserved: provably never dispatched → drop the lease (by enumerated path,
+      // under its own lock) + close the empty session.
+      idempotencyStore.removeByPathLocked(file);
+      quarantined.add(record.sessionId);
+      if (getSession(record.sessionId)) {
+        try { await closeSession(record.sessionId); } catch (e) { logger.warn(`[idempotency] reconcile close ${record.sessionId} failed: ${(e as Error).message}`); }
       }
     } catch (err) {
-      // One bad lease must not abort the whole sweep.
-      // eslint-disable-next-line no-console
-      logger.warn(`[idempotency] boot reconcile skipped ${file}: ${(err as Error).message}`);
+      logger.warn(`[idempotency] boot reconcile skipped a lease: ${(err as Error).message}`);
     }
   }
+  return quarantined;
 }
 
 function waitForSessionFinalOutput(
@@ -910,42 +922,40 @@ export async function triggerSessionTurn(
   // (fail-closed: never fall through to a fork that could double-run).
   let idempotencyLease: idempotencyStore.IdempotencyRecord | undefined;
   if (idempotencyKey) {
-    try {
-      if (idempotencyTakeover) {
-        idempotencyLease = idempotencyStore.takeover({
-          ownerLarkAppId: larkAppId, key: idempotencyKey, from: idempotencyTakeover,
-          sessionId: session.sessionId, triggerId, requestHash, ownerBootId, now: Date.now(),
-        });
-      } else {
-        const res = idempotencyStore.claim({
-          ownerLarkAppId: larkAppId, sessionId: session.sessionId, triggerId,
-          requestHash, ownerBootId, key: idempotencyKey, now: Date.now(),
-        });
-        if (res.kind === 'existing') {
-          // Lost a concurrent create race — hand back the winner, tear ours down.
-          await closeSession(session.sessionId);
-          const winnerChatId = activeBySessionId(deps.activeSessions, res.record.sessionId)?.chatId
-            ?? sessionStore.getSession(res.record.sessionId)?.chatId
-            ?? chatId;
-          // A same-payload winner is `attempting`/`reserved`/completed — reuse it.
-          // An ambiguous-crash terminal is only reachable if the winner's owning
-          // boot already died mid-flight (not this fresh race), handled generally.
-          if (res.record.state === 'terminal') {
-            return {
-              ok: false, state: 'failed', triggerId: res.record.triggerId,
-              errorCode: 'no_output', error: 'previous dispatch outcome is unknown (ambiguous crash); not re-run (at-most-once)',
-              target: { kind: 'turn', sessionId: res.record.sessionId, chatId: winnerChatId },
-              idempotencyKey, idempotent: true,
-            };
-          }
-          return {
-            ...buildAsyncQueuedResponse(res.record.triggerId, res.record.sessionId, winnerChatId,
-              'idempotency key concurrently claimed; reusing the winning session (no new dispatch)'),
-            idempotencyKey, idempotent: true,
-          };
-        }
-        idempotencyLease = res.record;
+    // Handle a claim/takeover that resolved to an EXISTING winner (we lost the
+    // race, or the older-boot lease was advanced/seized by someone else): tear
+    // down our just-created session and resolve from the winner's terminal
+    // evidence (via resolveIdempotencyHit → async-store), never dispatching.
+    const reuseExistingWinner = async (winner: idempotencyStore.IdempotencyRecord): Promise<TriggerResponse> => {
+      await closeSession(session.sessionId);
+      const decision = resolveIdempotencyHit(winner, ownerBootId, deps.activeSessions);
+      const winnerChatId = (decision.kind !== 'takeover' && decision.chatId) ? decision.chatId : chatId;
+      if (decision.kind === 'terminal') {
+        return {
+          ok: false, state: 'failed', triggerId: winner.triggerId,
+          errorCode: 'no_output', error: decision.message,
+          target: { kind: 'turn', sessionId: winner.sessionId, chatId: winnerChatId },
+          idempotencyKey, idempotent: true,
+        };
       }
+      return {
+        ...buildAsyncQueuedResponse(winner.triggerId, winner.sessionId, winnerChatId,
+          'idempotency key already claimed; reusing the winning session (no new dispatch)'),
+        idempotencyKey, idempotent: true,
+      };
+    };
+    try {
+      const res = idempotencyTakeover
+        ? idempotencyStore.takeover({
+            ownerLarkAppId: larkAppId, key: idempotencyKey, expect: idempotencyTakeover,
+            sessionId: session.sessionId, triggerId, requestHash, ownerBootId, now: Date.now(),
+          })
+        : idempotencyStore.claim({
+            ownerLarkAppId: larkAppId, sessionId: session.sessionId, triggerId,
+            requestHash, ownerBootId, key: idempotencyKey, now: Date.now(),
+          });
+      if (res.kind === 'existing') return await reuseExistingWinner(res.record);
+      idempotencyLease = res.record;
     } catch (err) {
       if (err instanceof idempotencyStore.IdempotencyConflictError) {
         await closeSession(session.sessionId);
@@ -957,11 +967,11 @@ export async function triggerSessionTurn(
   }
 
   // CAS the lease reserved→attempting immediately before dispatch (commit-unknown
-  // barrier). Returns the response fields to merge; throws → caller rolls back.
+  // barrier). Throws → caller rolls back (releases the reserved lease).
   const markAttemptingBeforeDispatch = (): void => {
     if (idempotencyKey && idempotencyLease) {
       idempotencyLease = idempotencyStore.transition(larkAppId, idempotencyKey, idempotencyLease, {
-        state: 'attempting', ownerBootId, now: Date.now(),
+        state: 'attempting', now: Date.now(),
       });
     }
   };
@@ -990,21 +1000,45 @@ export async function triggerSessionTurn(
   }
 
   if (req.options?.asyncReturnSessionId) {
-    // Commit-unknown barrier: mark the idempotency lease `attempting` durably
-    // BEFORE beginAsyncTrigger / forkWorker touch the worker. A crash from here
-    // on must NOT auto-redispatch (forkWorker returning isn't proof-of-no-run).
+    // Commit-unknown barrier: CAS the lease reserved→attempting durably BEFORE
+    // beginAsyncTrigger / forkWorker touch the worker.
+    // BEFORE the barrier (still `reserved`, provably no dispatch): a failure here
+    // must RELEASE our reserved lease (compare-and-remove) so a same-key retry
+    // can start fresh — otherwise ownerBootId===current makes the retry reuse a
+    // closed session forever (finding #5a).
     try {
       markAttemptingBeforeDispatch();
     } catch (err) {
+      if (idempotencyKey && idempotencyLease) {
+        try { idempotencyStore.compareAndRemove(larkAppId, idempotencyKey, idempotencyLease); } catch { /* best-effort release */ }
+      }
       await closeSession(session.sessionId);
       return { ok: false, errorCode: 'trigger_failed', error: `idempotency attempt-barrier failed: ${(err as Error).message}` };
     }
-    beginAsyncTrigger(newDs, triggerId);
-    const dispatchAttempt = prepareStableDispatch(newDs, true);
-    armFinalOutputSuppression(newDs, dispatchAttempt);
-    forkWorker(newDs, promptInput, dispatchAttempt === undefined
-      ? triggerId
-      : { turnId: triggerId, dispatchAttempt });
+    // AFTER the barrier (now `attempting`, commit-unknown): any synchronous throw
+    // from beginAsyncTrigger/prepare/forkWorker must NOT leave the caller polling
+    // `running` forever. Write the authoritative durable failed (dispatch_unknown)
+    // and close — at-most-once, never re-dispatched (finding #5b).
+    try {
+      beginAsyncTrigger(newDs, triggerId);
+      const dispatchAttempt = prepareStableDispatch(newDs, true);
+      armFinalOutputSuppression(newDs, dispatchAttempt);
+      forkWorker(newDs, promptInput, dispatchAttempt === undefined
+        ? triggerId
+        : { turnId: triggerId, dispatchAttempt });
+    } catch (err) {
+      if (idempotencyKey) {
+        try { asyncTriggerStore.recordFailedStrict(session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown'); }
+        catch (e) { logger.error(`[idempotency] failed to record dispatch_unknown after dispatch throw: ${(e as Error).message}`); }
+      }
+      try { await closeSession(session.sessionId); } catch { /* best-effort */ }
+      return {
+        ok: false, state: 'failed', triggerId,
+        errorCode: 'no_output', error: `dispatch failed with unknown outcome: ${(err as Error).message}`,
+        target: { kind: 'turn', sessionId: session.sessionId, chatId },
+        ...(idempotencyKey ? { idempotencyKey, idempotent: false } : {}),
+      };
+    }
     return {
       ...buildAsyncQueuedResponse(
         triggerId,

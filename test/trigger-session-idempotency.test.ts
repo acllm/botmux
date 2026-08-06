@@ -84,8 +84,9 @@ describe('resolveIdempotencyHit (at-most-once decisions)', () => {
     expect(d.kind).toBe('reuse');
   });
 
-  it('terminal lease → terminal (caller sees failed, never rerun)', () => {
-    const d = resolveIdempotencyHit(lease({ state: 'terminal', outcome: 'dispatch_unknown' }), 'boot-CURRENT', empty);
+  it('durable async failed (dispatch_unknown) → terminal (caller sees failed, never rerun)', () => {
+    asyncTriggerStore.recordFailedStrict('sess-1', 'trg_1', 200, OWNER, 'dispatch_unknown');
+    const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-OLD' }), 'boot-CURRENT', empty);
     expect(d.kind).toBe('terminal');
   });
 
@@ -117,40 +118,70 @@ describe('resolveIdempotencyHit (at-most-once decisions)', () => {
 });
 
 describe('reconcileIdempotencyLeasesOnBoot (crash convergence)', () => {
-  const empty = new Map<string, DaemonSession>();
+  // getSession stub driven by sessionRows.
+  const getSession = (id: string) => sessionRows.get(id);
 
-  it('attempting orphan → terminal dispatch_unknown + closes the orphaned session', async () => {
-    idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-att', triggerId: 'trg_att', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-att', now: 1 });
+  it('attempting orphan → durable async failed(dispatch_unknown) + close + quarantine', async () => {
     const { record } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-att', triggerId: 'trg_att', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-att', now: 1 }) as any;
     idempotencyStore.transition(OWNER, 'k-att', record, { state: 'attempting', now: 2 });
     sessionRows.set('sess-att', { sessionId: 'sess-att', status: 'open' });
 
-    await reconcileIdempotencyLeasesOnBoot(empty);
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
 
-    expect(idempotencyStore.lookup(OWNER, 'k-att')?.state).toBe('terminal');
-    expect(idempotencyStore.lookup(OWNER, 'k-att')?.outcome).toBe('dispatch_unknown');
+    // Terminal is in the async store (authoritative), not the lease.
+    const async = asyncTriggerStore.lookup('sess-att', 'trg_att');
+    expect(async?.result.status).toBe('failed');
+    expect(async?.result.reason).toBe('dispatch_unknown');
     expect(mockCloseSession).toHaveBeenCalledWith('sess-att');
+    expect(quarantined.has('sess-att')).toBe(true);
   });
 
-  it('reserved orphan → lease removed + never-dispatched session closed', async () => {
+  it('reserved orphan → lease removed + session closed + quarantine', async () => {
     idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-res', triggerId: 'trg_res', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-res', now: 1 });
     sessionRows.set('sess-res', { sessionId: 'sess-res', status: 'open' });
 
-    await reconcileIdempotencyLeasesOnBoot(empty);
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
 
     expect(idempotencyStore.lookup(OWNER, 'k-res')).toBeUndefined();
     expect(mockCloseSession).toHaveBeenCalledWith('sess-res');
+    expect(quarantined.has('sess-res')).toBe(true);
   });
 
-  it('completed lease → kept intact, session NOT closed (retry reuses + polls)', async () => {
+  it('completed → kept intact, session NOT closed, NOT quarantined', async () => {
     const { record } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-ok', triggerId: 'trg_ok', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-ok', now: 1 }) as any;
     idempotencyStore.transition(OWNER, 'k-ok', record, { state: 'attempting', now: 2 });
     asyncTriggerStore.recordCompleted('sess-ok', 'trg_ok', 'result', 100, OWNER);
 
-    await reconcileIdempotencyLeasesOnBoot(empty);
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
 
-    // completed → left as-is (still attempting on disk, but retry sees completed async result)
     expect(idempotencyStore.lookup(OWNER, 'k-ok')).toBeDefined();
     expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(quarantined.size).toBe(0);
+  });
+
+  it('CURRENT boot lease → skipped (not treated as previous-boot orphan)', async () => {
+    const { record } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-cur', triggerId: 'trg_cur', requestHash: 'h', ownerBootId: 'boot-CURRENT', key: 'k-cur', now: 1 }) as any;
+    idempotencyStore.transition(OWNER, 'k-cur', record, { state: 'attempting', now: 2 });
+    sessionRows.set('sess-cur', { sessionId: 'sess-cur', status: 'open' });
+
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
+
+    expect(asyncTriggerStore.lookup('sess-cur', 'trg_cur')).toBeUndefined(); // untouched
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(quarantined.size).toBe(0);
+  });
+
+  it('OTHER owner lease → never touched (cross-bot isolation)', async () => {
+    const { record } = idempotencyStore.claim({ ownerLarkAppId: 'cli_OTHER', sessionId: 'sess-other', triggerId: 'trg_other', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-other', now: 1 }) as any;
+    idempotencyStore.transition('cli_OTHER', 'k-other', record, { state: 'attempting', now: 2 });
+    sessionRows.set('sess-other', { sessionId: 'sess-other', status: 'open' });
+
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
+
+    // Another bot's lease + session must be byte-untouched.
+    expect(idempotencyStore.lookup('cli_OTHER', 'k-other')?.state).toBe('attempting');
+    expect(asyncTriggerStore.lookup('sess-other', 'trg_other')).toBeUndefined();
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(quarantined.size).toBe(0);
   });
 });

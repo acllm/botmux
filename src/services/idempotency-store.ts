@@ -1,77 +1,55 @@
 /**
- * Idempotency store — durable dispatch-lease keyed by a caller-provided
- * `options.idempotencyKey` (scoped per owning bot), so a retried `/api/trigger`
- * with the same key returns the SAME session instead of dispatching the turn a
- * second time.
+ * Idempotency dispatch lease keyed by a caller-provided `options.idempotencyKey`
+ * (scoped per owning bot). The lease answers exactly ONE question: "may I
+ * dispatch this turn?" — it does NOT define what a caller sees as the terminal
+ * outcome. That terminal outcome lives in async-trigger-store (pending /
+ * completed / failed:dispatch_unknown), which trigger-result reads directly.
+ * Separating the two means correctness never depends on closeSession succeeding
+ * or on a second tombstone file (see PR #776 review 4878071011).
  *
- * Why this exists: an async caller (e.g. the riff task runner) that loses the
- * `/api/trigger` HTTP response — the daemon already created the session, but the
- * ACK never arrived — retries. Without idempotency the retry builds a brand new
- * session and the turn runs twice (duplicate external side effects). The caller's
- * own dedup can't help: the first session is genuinely already executing.
+ * States: reserved (claimed, not yet dispatched) → attempting (durably written
+ * BEFORE any fork/worker IPC side effect — commit-unknown). There is no
+ * "dispatched"/"completed" lease state: completion is proven by async-trigger
+ * store, and an attempting lease is a permanent "do-not-redispatch" fence.
  *
- * SEMANTICS (at-most-once). This is a lease with an explicit dispatch state, NOT
- * a "session row exists → reuse" map — the latter would suppress a turn that
- * crashed BEFORE dispatch forever (permanent `running`). States:
- *   - reserved:   key claimed, NO dispatch attempted yet. Only the claim owner
- *                 (this boot) may advance it. A `reserved` record left by an
- *                 OLDER boot is provably pre-dispatch (we always CAS→attempting
- *                 before any fork/IPC side effect), so it is safe to take over.
- *   - attempting: durably written BEFORE any fork/worker IPC side effect. Once
- *                 here the turn is commit-unknown: `forkWorker` returning is NOT
- *                 proof the CLI didn't start, so a crash in `attempting` must
- *                 NEVER auto-redispatch. Completion is proven out-of-band via the
- *                 async-trigger store (final_output → recordCompleted); if that
- *                 proof is absent after the owning boot is gone, the turn
- *                 resolves to the terminal `dispatch_unknown` (never rerun).
- *   - terminal:   settled to `dispatch_unknown` (ambiguous crash). Completed
- *                 turns are NOT stored here — completion lives in async-trigger
- *                 store; callers derive `completed` from there.
+ * CONCURRENCY. rename(2) gives an atomic REPLACE, not a compare-and-swap. Every
+ * mutation therefore runs inside withFileLockSync(recordPath) (cross-process,
+ * per-key): read → verify full immutable identity + revision/state → durable
+ * atomic write, all under the lock. `atomicWriteFileSync` (tmp+fsync+rename,
+ * failure PRESERVES the old file) is used everywhere — never unlink→link, which
+ * could erase the only commit-unknown fence on an I/O failure.
  *
- * Ownership: (ownerLarkAppId, key) scoping + `ownerBootId` (this daemon process)
- * + a monotonic `revision` for CAS. A request routed to daemon A carrying bot
- * B's key is rejected fail-closed via the stamped owner.
+ * OWNERSHIP. (ownerLarkAppId, key) scoping + `ownerBootId` (this daemon process)
+ * + monotonic `revision`. Cross-bot reads are rejected fail-closed. Older-boot
+ * takeover of a `reserved` lease is safe under the repo's "one daemon per bot"
+ * invariant (daemon.ts): a different ownerBootId for the same bot means the
+ * previous process, which cannot still be advancing this lease.
  *
- * requestHash binds the key to its business payload: a same-key retry with a
- * DIFFERENT payload is a caller bug and must 409, never silently join the old
- * turn. Hash excludes the key itself and the daemon-generated session/chat ids.
- *
- * Persistence mirrors async-trigger-store: {dataDir}/idempotency/{h}.json where
- * h = sha256(ownerLarkAppId \0 key) — hashing keeps arbitrary caller key bytes
- * out of the filesystem path. FAIL-CLOSED: any I/O or corruption error on the
- * claim path throws (the caller rolls back the just-created session and returns
- * 5xx before dispatch) — never best-effort, which would fail-open to a double
- * dispatch.
+ * FAIL-CLOSED. Any ambiguous I/O / corruption on the claim path THROWS — the
+ * caller rolls back the just-created session and returns 5xx before dispatch.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, linkSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { withFileLockSync } from '../utils/file-lock.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
-export type IdempotencyState = 'reserved' | 'attempting' | 'terminal';
-export type IdempotencyOutcome = 'dispatch_unknown';
+export type IdempotencyState = 'reserved' | 'attempting';
 
 export interface IdempotencyRecord {
   ownerLarkAppId: string;
   sessionId: string;
   triggerId: string;
   requestHash: string;
-  /** The daemon boot (process) that owns the in-flight advance of this lease. */
   ownerBootId: string;
-  /** Monotonic CAS token — every durable transition bumps it. */
   revision: number;
   state: IdempotencyState;
-  /** Set only when state==='terminal'. */
-  outcome?: IdempotencyOutcome;
   createdAt: number;
   updatedAt: number;
 }
 
-/** Result of a claim attempt. `won` = we created a fresh reserved lease (caller
- *  proceeds to dispatch). `existing` = a live record already owns this key
- *  (caller reuses it — never dispatches). Any ambiguous I/O error THROWS instead
- *  of resolving to either, so the caller fail-closes before dispatch. */
 export type ClaimResult =
   | { kind: 'won'; record: IdempotencyRecord }
   | { kind: 'existing'; record: IdempotencyRecord };
@@ -98,14 +76,19 @@ function ensureDir(): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
-/** Read + validate a record. Returns undefined only when the file is ABSENT.
- *  A present-but-corrupt/unreadable file THROWS — on the claim path an
- *  unreadable existing record is NOT provably absent, so treating it as absent
- *  would fail-open to a double dispatch. */
+/** Acquire the per-key file lock, ensuring the idempotency dir exists first so
+ *  withFileLockSync can create its `<path>.lock` sibling. All mutators route
+ *  through here so the lock and the record live in a materialized directory. */
+function withKeyLock<T>(fp: string, fn: () => T): T {
+  ensureDir();
+  return withFileLockSync(fp, fn);
+}
+
+/** Read + validate. undefined only when ABSENT. Present-but-corrupt THROWS
+ *  (on the claim path an unreadable record is NOT provably absent). */
 function readRecord(fp: string): IdempotencyRecord | undefined {
   if (!existsSync(fp)) return undefined;
-  const raw = readFileSync(fp, 'utf-8'); // ENOENT race → throw (fail-closed)
-  const data = JSON.parse(raw) as IdempotencyRecord; // corrupt JSON → throw
+  const data = JSON.parse(readFileSync(fp, 'utf-8')) as IdempotencyRecord;
   if (
     !data || typeof data !== 'object'
     || typeof data.ownerLarkAppId !== 'string'
@@ -114,23 +97,33 @@ function readRecord(fp: string): IdempotencyRecord | undefined {
     || typeof data.requestHash !== 'string'
     || typeof data.ownerBootId !== 'string'
     || typeof data.revision !== 'number'
-    || (data.state !== 'reserved' && data.state !== 'attempting' && data.state !== 'terminal')
+    || (data.state !== 'reserved' && data.state !== 'attempting')
   ) {
     throw new Error(`corrupt idempotency record: ${fp}`);
   }
   return data;
 }
 
-/** Best-effort read for NON-claim paths (boot reconcile enumeration): a corrupt
- *  file is logged and skipped rather than throwing, so one bad file can't abort
- *  the whole reconcile sweep. */
-function readRecordLenient(fp: string): IdempotencyRecord | undefined {
-  try { return readRecord(fp); }
-  catch (err) { logger.warn(`[idempotency] skipping unreadable record ${fp}: ${err}`); return undefined; }
+function writeRecord(fp: string, rec: IdempotencyRecord): void {
+  ensureDir();
+  atomicWriteFileSync(fp, JSON.stringify(rec, null, 2), { durable: true, followTargetSymlink: false });
 }
 
-/** Public lookup for the trigger path. Owner mismatch → undefined (fail-closed:
- *  another bot's record is never reused). Corrupt file THROWS (see readRecord). */
+/** True iff two records share the immutable identity fields (everything a CAS
+ *  must pin besides the mutable state/revision/updatedAt). */
+function sameIdentity(a: IdempotencyRecord, b: {
+  ownerLarkAppId: string; sessionId: string; triggerId: string; requestHash: string; ownerBootId: string;
+}): boolean {
+  return a.ownerLarkAppId === b.ownerLarkAppId
+    && a.sessionId === b.sessionId
+    && a.triggerId === b.triggerId
+    && a.requestHash === b.requestHash
+    && a.ownerBootId === b.ownerBootId;
+}
+
+/** Non-locking read for the pre-check in trigger-session (a fast reject before
+ *  creating a session). Owner mismatch → undefined. Corrupt → THROWS. The
+ *  authoritative decision is always re-taken under the lock in claim/takeover. */
 export function lookup(ownerLarkAppId: string, key: string): IdempotencyRecord | undefined {
   const rec = readRecord(fileFor(ownerLarkAppId, key));
   if (!rec) return undefined;
@@ -138,158 +131,123 @@ export function lookup(ownerLarkAppId: string, key: string): IdempotencyRecord |
   return rec;
 }
 
-/** Atomically write a record to a fresh path via wx-temp + link(2). `expectNew`
- *  true → the link MUST create (EEXIST = someone else won). false → an existing
- *  file is replaced (used for CAS transitions, which first re-read + verify). */
-function writeAtomic(fp: string, rec: IdempotencyRecord, expectNew: boolean): 'written' | 'exists' {
-  ensureDir();
-  const tmp = `${fp}.${process.pid}.${createHash('sha256').update(String(rec.updatedAt)).update(rec.sessionId).update(String(rec.revision)).digest('hex').slice(0, 12)}.tmp`;
-  try {
-    writeFileSync(tmp, JSON.stringify(rec, null, 2), { encoding: 'utf-8', flag: 'wx' });
-    if (expectNew) {
-      try { linkSync(tmp, fp); return 'written'; }
-      catch (err: any) { if (err?.code === 'EEXIST') return 'exists'; throw err; }
+/**
+ * Claim (owner, key) for a fresh `reserved` lease, or return the existing one —
+ * all inside the per-key lock (read → decide → durable write is atomic wrt other
+ * daemons/boots). Throws on corrupt/IO (fail-closed) and on payload conflict.
+ */
+export function claim(input: {
+  ownerLarkAppId: string; sessionId: string; triggerId: string;
+  requestHash: string; ownerBootId: string; key: string; now: number;
+}): ClaimResult {
+  const fp = fileFor(input.ownerLarkAppId, input.key);
+  return withKeyLock(fp, () => {
+    const existing = readRecord(fp);
+    if (existing) {
+      if (existing.ownerLarkAppId !== input.ownerLarkAppId) throw new Error('idempotency record owner mismatch');
+      if (existing.requestHash !== input.requestHash) throw new IdempotencyConflictError(existing);
+      return { kind: 'existing', record: existing };
     }
-    // Replace: unlink existing then link. The whole claim path is serialized
-    // per-key by an in-process mutex (one daemon = one bot), so this is not a
-    // cross-process CAS — link EEXIST on the fresh-claim path is the only
-    // cross-process race guard we rely on.
-    try { if (existsSync(fp)) unlinkSync(fp); } catch { /* re-link will surface */ }
-    linkSync(tmp, fp);
-    return 'written';
-  } finally {
-    try { unlinkSync(tmp); } catch { /* already gone */ }
-  }
+    const rec: IdempotencyRecord = {
+      ownerLarkAppId: input.ownerLarkAppId, sessionId: input.sessionId, triggerId: input.triggerId,
+      requestHash: input.requestHash, ownerBootId: input.ownerBootId,
+      revision: 1, state: 'reserved', createdAt: input.now, updatedAt: input.now,
+    };
+    writeRecord(fp, rec);
+    return { kind: 'won', record: rec };
+  });
 }
 
 /**
- * Claim (owner, key) for a fresh reserved lease, or return the existing record.
- * Throws on any ambiguous I/O/corruption error (fail-closed). Throws
- * IdempotencyConflictError when an existing record's requestHash differs.
+ * Take over an OLDER-boot `reserved` lease with a fresh reserved lease (new
+ * session/trigger), OR return the existing record if it's no longer a takeover
+ * target — all under the lock, re-reading current state (never trusting the
+ * caller's stale `from`). Returns won|existing so the caller handles a loss like
+ * a claim loss (close its new session, don't fork). Throws on conflict/IO.
  *
- * Caller contract: on `won`, proceed to dispatch (transition to attempting
- * FIRST, via markAttempting). On `existing`, NEVER dispatch — resolve from the
- * record's state.
+ *  - absent now → won (fresh claim).
+ *  - present, still the SAME older-boot reserved (identity+revision match) → won (replace).
+ *  - present, same payload but changed (attempting / newer revision / different
+ *    boot) → existing (someone advanced it; reuse, don't take over).
+ *  - present, different payload → conflict.
  */
-export function claim(input: {
-  ownerLarkAppId: string;
-  sessionId: string;
-  triggerId: string;
-  requestHash: string;
-  ownerBootId: string;
-  key: string;
-  now: number;
+export function takeover(input: {
+  ownerLarkAppId: string; key: string; expect: IdempotencyRecord;
+  sessionId: string; triggerId: string; requestHash: string; ownerBootId: string; now: number;
 }): ClaimResult {
   const fp = fileFor(input.ownerLarkAppId, input.key);
-  const existing = readRecord(fp); // throws on corrupt (fail-closed)
-  if (existing) {
-    if (existing.ownerLarkAppId !== input.ownerLarkAppId) {
-      // Filename collision across owners is cryptographically implausible, but
-      // an owner-stamp mismatch is unattributable → fail-closed.
-      throw new Error('idempotency record owner mismatch');
+  return withKeyLock(fp, () => {
+    const current = readRecord(fp);
+    if (!current) {
+      const rec: IdempotencyRecord = {
+        ownerLarkAppId: input.ownerLarkAppId, sessionId: input.sessionId, triggerId: input.triggerId,
+        requestHash: input.requestHash, ownerBootId: input.ownerBootId,
+        revision: 1, state: 'reserved', createdAt: input.now, updatedAt: input.now,
+      };
+      writeRecord(fp, rec);
+      return { kind: 'won', record: rec };
     }
-    if (existing.requestHash !== input.requestHash) {
-      throw new IdempotencyConflictError(existing);
+    if (current.ownerLarkAppId !== input.ownerLarkAppId) throw new Error('idempotency record owner mismatch');
+    if (current.requestHash !== input.requestHash) throw new IdempotencyConflictError(current);
+    // Only replace the EXACT older-boot reserved lease we saw. Anything else
+    // (advanced to attempting, bumped revision, or now owned by a live boot) is
+    // reused, not seized.
+    const stillTakeoverTarget =
+      current.state === 'reserved'
+      && current.revision === input.expect.revision
+      && current.ownerBootId === input.expect.ownerBootId
+      && current.ownerBootId !== input.ownerBootId
+      && sameIdentity(current, input.expect);
+    if (!stillTakeoverTarget) {
+      return { kind: 'existing', record: current };
     }
-    return { kind: 'existing', record: existing };
-  }
-  const rec: IdempotencyRecord = {
-    ownerLarkAppId: input.ownerLarkAppId,
-    sessionId: input.sessionId,
-    triggerId: input.triggerId,
-    requestHash: input.requestHash,
-    ownerBootId: input.ownerBootId,
-    revision: 1,
-    state: 'reserved',
-    createdAt: input.now,
-    updatedAt: input.now,
-  };
-  const outcome = writeAtomic(fp, rec, /*expectNew*/ true);
-  if (outcome === 'exists') {
-    // Lost the create race — read the winner (throws if now corrupt).
-    const winner = readRecord(fp);
-    if (!winner) throw new Error('idempotency claim race: winner vanished');
-    if (winner.requestHash !== input.requestHash) throw new IdempotencyConflictError(winner);
-    return { kind: 'existing', record: winner };
-  }
-  return { kind: 'won', record: rec };
+    const rec: IdempotencyRecord = {
+      ownerLarkAppId: input.ownerLarkAppId, sessionId: input.sessionId, triggerId: input.triggerId,
+      requestHash: input.requestHash, ownerBootId: input.ownerBootId,
+      revision: current.revision + 1, state: 'reserved', createdAt: current.createdAt, updatedAt: input.now,
+    };
+    writeRecord(fp, rec);
+    return { kind: 'won', record: rec };
+  });
 }
 
-/** CAS a record to a new state. Re-reads and verifies the on-disk revision
- *  matches `from.revision` before writing (rejects a stale writer). Returns the
- *  written record, or throws on mismatch/IO error. */
+/** CAS a record to a new state under the lock. Verifies full identity + revision
+ *  before writing (rejects a stale/foreign writer). Returns the written record. */
 export function transition(
-  ownerLarkAppId: string,
-  key: string,
-  from: IdempotencyRecord,
-  patch: { state: IdempotencyState; outcome?: IdempotencyOutcome; ownerBootId?: string; now: number },
+  ownerLarkAppId: string, key: string, from: IdempotencyRecord,
+  patch: { state: IdempotencyState; now: number },
 ): IdempotencyRecord {
   const fp = fileFor(ownerLarkAppId, key);
-  const current = readRecord(fp);
-  if (!current) throw new Error('idempotency transition: record vanished');
-  if (current.revision !== from.revision) {
-    throw new Error(`idempotency CAS conflict: on-disk revision ${current.revision} != expected ${from.revision}`);
-  }
-  const next: IdempotencyRecord = {
-    ...current,
-    state: patch.state,
-    outcome: patch.outcome,
-    ownerBootId: patch.ownerBootId ?? current.ownerBootId,
-    revision: current.revision + 1,
-    updatedAt: patch.now,
-  };
-  writeAtomic(fp, next, /*expectNew*/ false);
-  return next;
+  return withKeyLock(fp, () => {
+    const current = readRecord(fp);
+    if (!current) throw new Error('idempotency transition: record vanished');
+    if (current.revision !== from.revision || !sameIdentity(current, from)) {
+      throw new Error(`idempotency CAS conflict: on-disk record changed under expected revision ${from.revision}`);
+    }
+    const next: IdempotencyRecord = { ...current, state: patch.state, revision: current.revision + 1, updatedAt: patch.now };
+    writeRecord(fp, next);
+    return next;
+  });
 }
 
-/** Take over an older-boot `reserved` lease for a fresh dispatch: overwrite it
- *  with a NEW reserved lease owned by this boot (new session/trigger). Safe only
- *  because a reserved record is provably pre-dispatch (attempting is written
- *  before any side effect). Verifies the on-disk record is still the same
- *  reserved revision before replacing. */
-export function takeover(input: {
-  ownerLarkAppId: string;
-  key: string;
-  from: IdempotencyRecord;
-  sessionId: string;
-  triggerId: string;
-  requestHash: string;
-  ownerBootId: string;
-  now: number;
-}): IdempotencyRecord {
-  const fp = fileFor(input.ownerLarkAppId, input.key);
-  const current = readRecord(fp);
-  if (!current) {
-    // Vanished between lookup and takeover → fall back to a fresh claim.
-    const res = claim({ ...input, now: input.now });
-    return res.record;
-  }
-  if (current.revision !== input.from.revision || current.state !== 'reserved') {
-    throw new Error('idempotency takeover: lease changed under us');
-  }
-  const rec: IdempotencyRecord = {
-    ownerLarkAppId: input.ownerLarkAppId,
-    sessionId: input.sessionId,
-    triggerId: input.triggerId,
-    requestHash: input.requestHash,
-    ownerBootId: input.ownerBootId,
-    revision: current.revision + 1,
-    state: 'reserved',
-    createdAt: current.createdAt,
-    updatedAt: input.now,
-  };
-  writeAtomic(fp, rec, /*expectNew*/ false);
-  return rec;
+/** Compare-and-remove: delete the lease ONLY if it still matches `expect`
+ *  (identity + revision + state) under the lock. Used to release a `reserved`
+ *  lease we created but abandoned before dispatch. Returns true if removed. */
+export function compareAndRemove(ownerLarkAppId: string, key: string, expect: IdempotencyRecord): boolean {
+  const fp = fileFor(ownerLarkAppId, key);
+  return withKeyLock(fp, () => {
+    const current = readRecord(fp);
+    if (!current) return false;
+    if (current.revision !== expect.revision || current.state !== expect.state || !sameIdentity(current, expect)) {
+      return false;
+    }
+    try { unlinkSync(fp); } catch { /* already gone */ }
+    return true;
+  });
 }
 
-/** Remove a mapping (used on rollback of a lease we created but abandoned, and
- *  by boot reconcile for pre-dispatch orphans). Idempotent. */
-export function remove(ownerLarkAppId: string, key: string): void {
-  try { const fp = fileFor(ownerLarkAppId, key); if (existsSync(fp)) unlinkSync(fp); }
-  catch { /* ignore */ }
-}
-
-/** Enumerate every stored record for boot reconcile. Best-effort per file. */
+/** Enumerate every stored lease (boot reconcile). Best-effort per file: a
+ *  corrupt file is logged + skipped so it can't abort the sweep. */
 export function listAll(): Array<{ file: string; record: IdempotencyRecord }> {
   const dir = getDir();
   if (!existsSync(dir)) return [];
@@ -297,28 +255,20 @@ export function listAll(): Array<{ file: string; record: IdempotencyRecord }> {
   for (const name of readdirSync(dir)) {
     if (!name.endsWith('.json')) continue;
     const fp = join(dir, name);
-    const rec = readRecordLenient(fp);
-    if (rec) out.push({ file: fp, record: rec });
+    try {
+      const rec = readRecord(fp);
+      if (rec) out.push({ file: fp, record: rec });
+    } catch (err) {
+      logger.warn(`[idempotency] skipping unreadable lease ${fp}: ${err}`);
+    }
   }
   return out;
 }
 
-/** Reconcile-only: rewrite a record in place by its file path (the plaintext key
- *  isn't recoverable from the hashed filename, and reconcile already holds the
- *  path from listAll). */
-export function writeAtomicByPath(fp: string, rec: IdempotencyRecord): void {
-  ensureDir();
-  const tmp = `${fp}.${process.pid}.${createHash('sha256').update(String(rec.updatedAt)).update(rec.sessionId).update(String(rec.revision)).digest('hex').slice(0, 12)}.tmp`;
-  try {
-    writeFileSync(tmp, JSON.stringify(rec, null, 2), { encoding: 'utf-8', flag: 'wx' });
-    try { if (existsSync(fp)) unlinkSync(fp); } catch { /* re-link surfaces */ }
-    linkSync(tmp, fp);
-  } finally {
-    try { unlinkSync(tmp); } catch { /* gone */ }
-  }
-}
-
-/** Reconcile-only: delete a record by file path. */
-export function removeByPath(fp: string): void {
-  try { if (existsSync(fp)) unlinkSync(fp); } catch { /* ignore */ }
+/** Reconcile-only remove by path, under a lock keyed on that path. Used by boot
+ *  reconcile to drop a pre-dispatch `reserved` lease. Best-effort. */
+export function removeByPathLocked(fp: string): void {
+  withKeyLock(fp, () => {
+    try { if (existsSync(fp)) unlinkSync(fp); } catch { /* ignore */ }
+  });
 }

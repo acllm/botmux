@@ -18965,6 +18965,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
   // so dashboard IPC and other consumers can list/lookup live sessions.
   setActiveSessionsRegistry(activeSessions);
+
+  // Idempotency boot reconcile — MUST run before startIpcServer binds (a normal
+  // fleet has no core-only readiness gate, so a live /api/trigger could otherwise
+  // interleave with the sweep and have its fresh lease mistaken for stale) and is
+  // scoped to THIS bot (the dataDir is shared across bots). Converges leases left
+  // by a previous boot: `attempting` → durable failed(dispatch_unknown) + close;
+  // `reserved` → drop + close. Returns the sessionIds it terminalized/closed so
+  // restoreActiveSessions can quarantine them from re-attach (else a session the
+  // poller now sees `failed` could be reattached and keep running — state/exec
+  // divergence). sessionStore is init'd + worker pool is up by here.
+  let idempotencyQuarantinedSessionIds = new Set<string>();
+  try {
+    idempotencyQuarantinedSessionIds = await reconcileIdempotencyLeasesOnBoot(cfg.larkAppId, getDaemonBootId());
+  } catch (err) {
+    // A failed reconcile means an ambiguous turn might still poll `running` — do
+    // not proceed as if converged; surface loudly. (recordFailedStrict throwing
+    // is the main way this happens.)
+    logger.error(`[idempotency] boot reconcile failed — some leases may be unconverged: ${err instanceof Error ? err.message : err}`);
+  }
   // Seed dashboard IPC botName with the custom displayName (falling back to the
   // bot's config id); the friendly name from /bot/v3/info is wired into the
   // registry descriptor (below) but the IPC server also needs its own copy for
@@ -19309,21 +19328,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   reapOrphanWorkers();
 
   // Restore active sessions from previous run
-  await restoreActiveSessions(activeSessions);
+  // Restore active sessions from previous run
+  await restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds);
   // Restore complete → /api/asks may now safely 403 unknown sessions again; a
   // reconnecting ask hook that raced the restore got retryable 503s until here.
   sessionsRestored = true;
-
-  // Converge idempotency dispatch leases orphaned by the previous process:
-  // ambiguous `attempting` leases become terminal `dispatch_unknown` (so a
-  // poller stops seeing `running`), pre-dispatch `reserved` leases are cleared.
-  // Runs after restore (needs the populated session map) and before the IPC
-  // server accepts requests (single-threaded, no CAS).
-  try {
-    await reconcileIdempotencyLeasesOnBoot(activeSessions);
-  } catch (err) {
-    logger.warn(`[idempotency] boot reconcile failed: ${err instanceof Error ? err.message : err}`);
-  }
 
   // Now that activeSessions is populated, release the forward-followup flush
   // barrier. Persisted seeds were loaded into the buffer at dispatcher startup

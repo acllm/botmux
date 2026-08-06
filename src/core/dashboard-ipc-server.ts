@@ -2146,6 +2146,13 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
     const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
     const status = result.ok
       ? 200
+      // An idempotent retry that resolves to a durable `failed` async state is a
+      // successful HTTP call reporting a terminal outcome (like a 200 completed/
+      // queued), not a request error — surface it 200 so the caller reads `state`.
+      : result.state === 'failed'
+        ? 200
+      : result.errorCode === 'idempotency_conflict'
+        ? 409
       : result.errorCode === 'bot_not_in_chat'
         ? 403
         : result.errorCode === 'session_not_found'

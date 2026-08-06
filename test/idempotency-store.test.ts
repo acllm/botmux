@@ -1,121 +1,163 @@
 /**
- * Unit tests for idempotency-store: claim, lookup, remove — the durable
- * (ownerLarkAppId, key) → {sessionId, triggerId} mapping that lets a retried
- * /api/trigger return the SAME session instead of re-dispatching.
+ * Unit tests for idempotency-store: the at-most-once dispatch lease
+ * (reserved → attempting → terminal) with fail-closed I/O, CAS transitions,
+ * older-boot takeover, requestHash conflict, and reconcile enumeration.
  *
- * Uses a real temp directory with vi.mock to redirect config.session.dataDir,
- * mirroring async-trigger-store.test.ts / frozen-card-store.test.ts.
+ * Uses a real temp dir + vi.mock to redirect config.session.dataDir, mirroring
+ * async-trigger-store.test.ts.
  *
  * Run:  pnpm vitest run test/idempotency-store.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 let tempDir: string;
 
 vi.mock('../src/config.js', () => ({
-  config: {
-    session: {
-      get dataDir() { return tempDir; },
-    },
-  },
+  config: { session: { get dataDir() { return tempDir; } } },
 }));
-
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { claim, lookup, remove, type IdempotencyRecord } from '../src/services/idempotency-store.js';
+import {
+  claim, transition, takeover, lookup, remove, listAll,
+  writeAtomicByPath, removeByPath, IdempotencyConflictError,
+  type IdempotencyRecord,
+} from '../src/services/idempotency-store.js';
 
-const rec = (over: Partial<IdempotencyRecord> = {}): IdempotencyRecord => ({
-  sessionId: 'sess-1',
-  triggerId: 'trg_abc',
-  ownerLarkAppId: 'cli_bot_a',
-  createdAt: 1000,
-  ...over,
+const base = (over: Partial<Parameters<typeof claim>[0]> = {}) => ({
+  ownerLarkAppId: 'cli_a', sessionId: 'sess-1', triggerId: 'trg_1',
+  requestHash: 'sha256:h1', ownerBootId: 'boot-1', key: 'k1', now: 1000, ...over,
 });
 
-beforeEach(() => {
-  tempDir = mkdtempSync(join(tmpdir(), 'idempotency-store-test-'));
-});
-afterEach(() => {
-  rmSync(tempDir, { recursive: true, force: true });
-});
+beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'idem-store-')); });
+afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
 
-describe('claim + lookup', () => {
-  it('returns undefined for an unknown key', () => {
-    expect(lookup('cli_bot_a', 'never-seen')).toBeUndefined();
+describe('claim', () => {
+  it('wins a fresh key with a reserved lease', () => {
+    const res = claim(base());
+    expect(res.kind).toBe('won');
+    expect(res.record.state).toBe('reserved');
+    expect(res.record.revision).toBe(1);
+    expect(lookup('cli_a', 'k1')?.sessionId).toBe('sess-1');
   });
 
-  it('claims a fresh key and reads it back', () => {
-    const out = claim(rec(), 'key-1');
-    expect(out.sessionId).toBe('sess-1');
-    expect(out.triggerId).toBe('trg_abc');
-    const back = lookup('cli_bot_a', 'key-1');
-    expect(back?.sessionId).toBe('sess-1');
-    expect(back?.triggerId).toBe('trg_abc');
-    expect(back?.ownerLarkAppId).toBe('cli_bot_a');
+  it('returns existing (same payload) on a second claim — no overwrite', () => {
+    claim(base({ sessionId: 'sess-first', triggerId: 'trg_first' }));
+    const res = claim(base({ sessionId: 'sess-second', triggerId: 'trg_second', now: 2000 }));
+    expect(res.kind).toBe('existing');
+    expect(res.record.sessionId).toBe('sess-first');
+    expect(res.record.triggerId).toBe('trg_first');
   });
 
-  it('is idempotent: a second claim of the SAME key returns the FIRST winner (no overwrite)', () => {
-    claim(rec({ sessionId: 'sess-first', triggerId: 'trg_first' }), 'key-race');
-    // A concurrent/retried dispatch tries to claim the same key with a different
-    // freshly-created session — must get the first winner back, not overwrite.
-    const out = claim(rec({ sessionId: 'sess-second', triggerId: 'trg_second', createdAt: 2000 }), 'key-race');
-    expect(out.sessionId).toBe('sess-first');
-    expect(out.triggerId).toBe('trg_first');
-    // Disk still holds the winner.
-    expect(lookup('cli_bot_a', 'key-race')?.sessionId).toBe('sess-first');
-  });
-});
-
-describe('cross-bot isolation', () => {
-  it('same key under two different bots maps to independent records', () => {
-    claim(rec({ ownerLarkAppId: 'cli_bot_a', sessionId: 'sess-a' }), 'shared-key');
-    claim(rec({ ownerLarkAppId: 'cli_bot_b', sessionId: 'sess-b' }), 'shared-key');
-    expect(lookup('cli_bot_a', 'shared-key')?.sessionId).toBe('sess-a');
-    expect(lookup('cli_bot_b', 'shared-key')?.sessionId).toBe('sess-b');
+  it('throws IdempotencyConflictError on same key + different requestHash', () => {
+    claim(base({ requestHash: 'sha256:AAA' }));
+    expect(() => claim(base({ requestHash: 'sha256:BBB' }))).toThrow(IdempotencyConflictError);
   });
 
-  it('lookup with the wrong owner returns undefined (fail-closed, never cross-bot leak)', () => {
-    claim(rec({ ownerLarkAppId: 'cli_bot_a', sessionId: 'sess-a' }), 'key-x');
-    // Bot B asking for bot A's key sees nothing.
-    expect(lookup('cli_bot_b', 'key-x')).toBeUndefined();
+  it('cross-owner: same key under two bots are independent', () => {
+    claim(base({ ownerLarkAppId: 'cli_a', sessionId: 'sess-a' }));
+    claim(base({ ownerLarkAppId: 'cli_b', sessionId: 'sess-b' }));
+    expect(lookup('cli_a', 'k1')?.sessionId).toBe('sess-a');
+    expect(lookup('cli_b', 'k1')?.sessionId).toBe('sess-b');
   });
 
-  it('key prefix/suffix cannot collide across owners (NUL-separated hash)', () => {
-    // (owner="a", key="bc") vs (owner="ab", key="c") must be distinct files.
-    claim(rec({ ownerLarkAppId: 'a', sessionId: 'sess-abc-1' }), 'bc');
-    claim(rec({ ownerLarkAppId: 'ab', sessionId: 'sess-abc-2' }), 'c');
-    expect(lookup('a', 'bc')?.sessionId).toBe('sess-abc-1');
-    expect(lookup('ab', 'c')?.sessionId).toBe('sess-abc-2');
+  it('FAIL-CLOSED: a corrupt existing record throws (never treated as absent)', () => {
+    claim(base());
+    // Corrupt the single stored file.
+    const files = readdirSync(tempDir + '/idempotency').filter(f => f.endsWith('.json'));
+    expect(files.length).toBe(1);
+    writeFileSync(join(tempDir, 'idempotency', files[0]), '{ not json', 'utf-8');
+    expect(() => claim(base())).toThrow();
+    expect(() => lookup('cli_a', 'k1')).toThrow();
   });
 });
 
-describe('remove', () => {
-  it('deletes a mapping and is idempotent', () => {
-    claim(rec(), 'key-del');
-    expect(lookup('cli_bot_a', 'key-del')).toBeDefined();
-    remove('cli_bot_a', 'key-del');
-    expect(lookup('cli_bot_a', 'key-del')).toBeUndefined();
-    // Second remove doesn't throw.
-    expect(() => remove('cli_bot_a', 'key-del')).not.toThrow();
+describe('transition (CAS)', () => {
+  it('advances reserved → attempting and bumps revision', () => {
+    const { record } = claim(base()) as { record: IdempotencyRecord };
+    const next = transition('cli_a', 'k1', record, { state: 'attempting', now: 2000 });
+    expect(next.state).toBe('attempting');
+    expect(next.revision).toBe(2);
+    expect(lookup('cli_a', 'k1')?.state).toBe('attempting');
+  });
+
+  it('rejects a stale-revision writer (CAS conflict)', () => {
+    const { record } = claim(base()) as { record: IdempotencyRecord };
+    transition('cli_a', 'k1', record, { state: 'attempting', now: 2000 }); // rev→2
+    // Second writer still holding rev-1 record must fail.
+    expect(() => transition('cli_a', 'k1', record, { state: 'terminal', outcome: 'dispatch_unknown', now: 3000 }))
+      .toThrow(/CAS conflict/);
   });
 });
 
-describe('durability shape', () => {
-  it('survives a fresh module read (persisted to disk, not in-memory)', () => {
-    claim(rec({ sessionId: 'sess-persist' }), 'key-persist');
-    // lookup re-reads the file each call (no in-memory cache), so this proves disk persistence.
-    expect(lookup('cli_bot_a', 'key-persist')?.sessionId).toBe('sess-persist');
+describe('takeover (older-boot reserved)', () => {
+  it('replaces an older-boot reserved lease with a fresh one', () => {
+    const { record } = claim(base({ ownerBootId: 'boot-OLD' })) as { record: IdempotencyRecord };
+    const fresh = takeover({
+      ownerLarkAppId: 'cli_a', key: 'k1', from: record,
+      sessionId: 'sess-NEW', triggerId: 'trg_NEW', requestHash: 'sha256:h1',
+      ownerBootId: 'boot-NEW', now: 5000,
+    });
+    expect(fresh.sessionId).toBe('sess-NEW');
+    expect(fresh.ownerBootId).toBe('boot-NEW');
+    expect(fresh.state).toBe('reserved');
+    expect(lookup('cli_a', 'k1')?.sessionId).toBe('sess-NEW');
   });
 
-  it('tolerates weird key bytes (path traversal / slashes) via hashed filename', () => {
-    const nasty = '../../etc/passwd\0/../x';
-    const out = claim(rec({ sessionId: 'sess-nasty' }), nasty);
-    expect(out.sessionId).toBe('sess-nasty');
-    expect(lookup('cli_bot_a', nasty)?.sessionId).toBe('sess-nasty');
+  it('refuses takeover if the lease changed under us (revision moved)', () => {
+    const { record } = claim(base({ ownerBootId: 'boot-OLD' })) as { record: IdempotencyRecord };
+    transition('cli_a', 'k1', record, { state: 'attempting', now: 2000 }); // now attempting rev2
+    expect(() => takeover({
+      ownerLarkAppId: 'cli_a', key: 'k1', from: record,
+      sessionId: 'sess-NEW', triggerId: 'trg_NEW', requestHash: 'sha256:h1', ownerBootId: 'boot-NEW', now: 5000,
+    })).toThrow(/lease changed/);
+  });
+});
+
+describe('reconcile enumeration', () => {
+  it('listAll returns every stored lease with its file path', () => {
+    claim(base({ key: 'k1', sessionId: 's1' }));
+    claim(base({ key: 'k2', sessionId: 's2' }));
+    const all = listAll();
+    expect(all.length).toBe(2);
+    expect(all.map(a => a.record.sessionId).sort()).toEqual(['s1', 's2']);
+    expect(all.every(a => a.file.endsWith('.json'))).toBe(true);
+  });
+
+  it('writeAtomicByPath rewrites a lease terminal in place; removeByPath deletes', () => {
+    const { record } = claim(base()) as { record: IdempotencyRecord };
+    const { file } = listAll()[0];
+    writeAtomicByPath(file, { ...record, state: 'terminal', outcome: 'dispatch_unknown', revision: record.revision + 1, updatedAt: 9000 });
+    expect(lookup('cli_a', 'k1')?.state).toBe('terminal');
+    expect(lookup('cli_a', 'k1')?.outcome).toBe('dispatch_unknown');
+    removeByPath(file);
+    expect(lookup('cli_a', 'k1')).toBeUndefined();
+  });
+
+  it('listAll skips (does not throw on) a corrupt file', () => {
+    claim(base({ key: 'good', sessionId: 'sg' }));
+    writeFileSync(join(tempDir, 'idempotency', 'deadbeef.json'), '{ corrupt', 'utf-8');
+    const all = listAll();
+    expect(all.length).toBe(1);
+    expect(all[0].record.sessionId).toBe('sg');
+  });
+});
+
+describe('remove + weird keys', () => {
+  it('remove deletes and is idempotent', () => {
+    claim(base());
+    remove('cli_a', 'k1');
+    expect(lookup('cli_a', 'k1')).toBeUndefined();
+    expect(() => remove('cli_a', 'k1')).not.toThrow();
+  });
+
+  it('tolerates path-traversal / NUL key bytes via hashed filename', () => {
+    const nasty = '../../etc/passwd\0/x';
+    claim(base({ key: nasty, sessionId: 'sn' }));
+    expect(lookup('cli_a', nasty)?.sessionId).toBe('sn');
   });
 });

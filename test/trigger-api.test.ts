@@ -126,8 +126,9 @@ describe('trigger request contract', () => {
     }
   });
 
-  it('accepts a well-formed idempotencyKey', () => {
+  it('accepts a well-formed idempotencyKey on a fresh async virtual trigger', () => {
     const req = request();
+    req.target = { kind: 'turn', botId: 'app1' }; // no chatId/sessionId/rootMessageId
     req.options = { asyncReturnSessionId: true, idempotencyKey: 'riff-task-fe4d3f7e' };
     expect(validateTriggerRequest(req).ok).toBe(true);
   });
@@ -135,14 +136,66 @@ describe('trigger request contract', () => {
   it('rejects an empty / whitespace-only / over-long / non-string idempotencyKey', () => {
     for (const idempotencyKey of ['', '   ', 'k'.repeat(201), 42, {}]) {
       const req = request();
-      (req.options as any) = { idempotencyKey };
+      req.target = { kind: 'turn', botId: 'app1' };
+      (req.options as any) = { asyncReturnSessionId: true, idempotencyKey };
       const v = validateTriggerRequest(req);
       expect(v.ok).toBe(false);
       if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
     }
   });
 
-  it('treats an absent idempotencyKey as valid (opt-in field)', () => {
+  it('rejects idempotencyKey outside fresh async virtual scope', () => {
+    // Each of these violates the fresh-async-virtual intersection and must 400.
+    const cases: Array<Partial<TriggerRequest['target']> & { options: any }> = [
+      // waitForFinalOutput (sync mode)
+      { botId: 'app1', options: { waitForFinalOutput: true, idempotencyKey: 'k' } },
+      // no async response mode at all
+      { botId: 'app1', options: { idempotencyKey: 'k' } },
+      // dryRun
+      { botId: 'app1', options: { asyncReturnSessionId: true, dryRun: true, idempotencyKey: 'k' } },
+    ];
+    for (const c of cases) {
+      const req = request();
+      req.target = { kind: 'turn', botId: 'app1' };
+      (req.options as any) = c.options;
+      const v = validateTriggerRequest(req);
+      // Rejected is what matters; some cases trip an earlier validator gate
+      // (target_required) before the idempotency scope check.
+      expect(v.ok).toBe(false);
+    }
+    // dryRun + async + botId passes every earlier gate, so MY scope check is
+    // the one that rejects it with bad_request — proves the narrowing fires.
+    {
+      const req = request();
+      req.target = { kind: 'turn', botId: 'app1' };
+      req.options = { asyncReturnSessionId: true, dryRun: true, idempotencyKey: 'k' } as any;
+      const v = validateTriggerRequest(req);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+    }
+    // target.sessionId present
+    {
+      const req = request();
+      req.target = { kind: 'turn', botId: 'app1', sessionId: 'bmx-123' };
+      req.options = { asyncReturnSessionId: true, idempotencyKey: 'k' };
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
+    // target.chatId present (the default request() has one)
+    {
+      const req = request();
+      req.options = { asyncReturnSessionId: true, idempotencyKey: 'k' };
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
+    // target.rootMessageId present
+    {
+      const req = request();
+      req.target = { kind: 'turn', botId: 'app1', rootMessageId: 'om_1' };
+      req.options = { asyncReturnSessionId: true, idempotencyKey: 'k' };
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
+  });
+
+  it('treats an absent idempotencyKey as valid (opt-in field, any mode)', () => {
     const req = request();
     req.options = { asyncReturnSessionId: true };
     expect(validateTriggerRequest(req).ok).toBe(true);

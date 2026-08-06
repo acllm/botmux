@@ -66,6 +66,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     return true;
   },
   closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true })),
+  getDaemonBootId: () => 'test-boot-id',
 }));
 
 const mockRememberLastCliInput = vi.fn();

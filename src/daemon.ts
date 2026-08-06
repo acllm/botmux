@@ -185,7 +185,7 @@ import {
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
 } from './core/session-manager.js';
-import { triggerSessionTurn } from './core/trigger-session.js';
+import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot } from './core/trigger-session.js';
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
@@ -19313,6 +19313,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Restore complete → /api/asks may now safely 403 unknown sessions again; a
   // reconnecting ask hook that raced the restore got retryable 503s until here.
   sessionsRestored = true;
+
+  // Converge idempotency dispatch leases orphaned by the previous process:
+  // ambiguous `attempting` leases become terminal `dispatch_unknown` (so a
+  // poller stops seeing `running`), pre-dispatch `reserved` leases are cleared.
+  // Runs after restore (needs the populated session map) and before the IPC
+  // server accepts requests (single-threaded, no CAS).
+  try {
+    await reconcileIdempotencyLeasesOnBoot(activeSessions);
+  } catch (err) {
+    logger.warn(`[idempotency] boot reconcile failed: ${err instanceof Error ? err.message : err}`);
+  }
 
   // Now that activeSessions is populated, release the forward-followup flush
   // barrier. Persisted seeds were loaded into the buffer at dispatcher startup

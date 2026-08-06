@@ -74,6 +74,7 @@ export type TriggerErrorCode =
   | 'bot_not_in_chat'
   | 'daemon_offline'
   | 'dry_run'
+  | 'idempotency_conflict'
   | 'invalid_signature'
   | 'chat_not_allowed'
   | 'legacy_workflow_retired'
@@ -228,6 +229,31 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (options.idempotencyKey !== undefined) {
     if (typeof options.idempotencyKey !== 'string' || options.idempotencyKey.trim().length === 0 || options.idempotencyKey.length > 200) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.idempotencyKey must be a non-empty string (<=200 chars)' } };
+    }
+    // Scope lock (fresh async virtual only): the dispatch lease is implemented
+    // solely on the fresh-session async-return seam, so the public contract must
+    // not advertise it anywhere else — an existing-session / wait / plain / dryRun
+    // retry would silently bypass the lease and double-run. Require the exact
+    // intersection: turn + asyncReturnSessionId, no wait/dryRun, and NO target
+    // that could resolve to an existing/real session (sessionId/rootMessageId/
+    // chatId — including a caller-forged http_async_*). Widen only via a new PR
+    // that extends the lease to those seams.
+    if (
+      target.kind !== 'turn'
+      || !asyncReturnSessionId
+      || waitForFinalOutput
+      || options.dryRun === true
+      || hasSessionId
+      || hasRootMessageId
+      || hasChatId
+    ) {
+      return {
+        ok: false, status: 400,
+        body: {
+          ok: false, errorCode: 'bad_request',
+          error: 'options.idempotencyKey is only supported for a fresh async virtual trigger (target.kind=turn, options.asyncReturnSessionId=true, no waitForFinalOutput/dryRun, and no target.sessionId/rootMessageId/chatId)',
+        },
+      };
     }
   }
   return { ok: true, request: raw as unknown as TriggerRequest };

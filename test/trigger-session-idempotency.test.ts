@@ -13,9 +13,10 @@
  * Run:  pnpm vitest run test/trigger-session-idempotency.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import type { DaemonSession } from '../src/core/types.js';
 
 let tempDir: string;
@@ -39,10 +40,12 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getDaemonBootId: () => 'boot-CURRENT',
 }));
 
-// session-store: only getSession is consulted by the decision/reconcile paths.
+// session-store: getSession + getOwnedSession are consulted by the decision/
+// reconcile paths (getOwnedSession is the owner-scoped read finding #3 requires).
 const sessionRows = new Map<string, any>();
 vi.mock('../src/services/session-store.js', () => ({
   getSession: (id: string) => sessionRows.get(id),
+  getOwnedSession: (id: string) => sessionRows.get(id),
   createSession: vi.fn(),
   updateSession: vi.fn(),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
@@ -77,38 +80,62 @@ afterEach(() => {
 
 describe('resolveIdempotencyHit (at-most-once decisions)', () => {
   const empty = new Map<string, DaemonSession>();
+  const liveFor = (sessionId: string, chatId = 'http_async_x') =>
+    new Map<string, DaemonSession>([['k', { session: { sessionId }, chatId } as any]]);
 
-  it('completed async result → reuse (poll it), regardless of lease state', () => {
+  it('completed async result (SAME owner) → reuse (poll it), regardless of lease state', () => {
     asyncTriggerStore.recordCompleted('sess-1', 'trg_1', 'done', 100, OWNER);
     const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-OLD' }), 'boot-CURRENT', empty);
     expect(d.kind).toBe('reuse');
   });
 
-  it('durable async failed (dispatch_unknown) → terminal (caller sees failed, never rerun)', () => {
+  it('durable async failed (SAME owner, dispatch_unknown) → terminal (caller sees failed, never rerun)', () => {
     asyncTriggerStore.recordFailedStrict('sess-1', 'trg_1', 200, OWNER, 'dispatch_unknown');
     const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-OLD' }), 'boot-CURRENT', empty);
     expect(d.kind).toBe('terminal');
   });
 
-  it('attempting + owning boot alive → reuse (turn genuinely in flight)', () => {
-    const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-CURRENT' }), 'boot-CURRENT', empty);
+  it('FINDING #3: a FOREIGN owner completed on the same session/trigger is IGNORED (no suppression of our dispatch)', () => {
+    // Bot B writes completed under the same sessionId/triggerId; A resolves its
+    // own attempting-orphan hit. The foreign completed must NOT flip A to reuse —
+    // A falls through to its own lease state (attempting + not-live → terminal).
+    asyncTriggerStore.recordCompleted('sess-1', 'trg_1', 'B answer', 100, 'cli_OTHER_BOT');
+    const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-OLD' }), 'boot-CURRENT', empty);
+    expect(d.kind).toBe('terminal'); // NOT reuse — foreign evidence ignored
+  });
+
+  it('FINDING #3: a FOREIGN owner failed does not terminalize a genuinely-live own turn', () => {
+    asyncTriggerStore.recordFailedStrict('sess-1', 'trg_1', 200, 'cli_OTHER_BOT', 'dispatch_unknown');
+    // Own turn is live in flight → foreign failed ignored → reuse (poll it).
+    const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-CURRENT' }), 'boot-CURRENT', liveFor('sess-1'));
     expect(d.kind).toBe('reuse');
   });
 
-  it('attempting + owning boot GONE + no completion → terminal (ambiguous crash, NO redispatch)', () => {
+  it('attempting + LIVE worker → reuse (turn genuinely in flight), any boot', () => {
+    const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-CURRENT' }), 'boot-CURRENT', liveFor('sess-1'));
+    expect(d.kind).toBe('reuse');
+  });
+
+  it('FINDING #1: attempting + SAME boot but NO live worker → terminal (orphaned crossed fence, no reuse-forever)', () => {
+    // The reuse-forever codex flagged: a same-boot attempting lease whose session
+    // was closed (barrier-fail couldn't delete the fence) must NOT be reused.
+    const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-CURRENT' }), 'boot-CURRENT', empty);
+    expect(d.kind).toBe('terminal');
+  });
+
+  it('attempting + owning boot GONE + no live worker + no completion → terminal (ambiguous crash, NO redispatch)', () => {
     const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-OLD' }), 'boot-CURRENT', empty);
     expect(d.kind).toBe('terminal');
   });
 
-  it('attempting + owning boot gone but a LIVE worker exists → reuse (in flight)', () => {
-    const live = new Map<string, DaemonSession>([['k', { session: { sessionId: 'sess-1' }, chatId: 'http_async_x' } as any]]);
-    const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-OLD' }), 'boot-CURRENT', live);
+  it('reserved + same boot + LIVE → reuse (owner mid-dispatch)', () => {
+    const d = resolveIdempotencyHit(lease({ state: 'reserved', ownerBootId: 'boot-CURRENT' }), 'boot-CURRENT', liveFor('sess-1'));
     expect(d.kind).toBe('reuse');
   });
 
-  it('reserved + same boot → reuse (owner advancing)', () => {
+  it('FINDING #1: reserved + same boot but NO live worker → terminal (abandoned pre-dispatch orphan)', () => {
     const d = resolveIdempotencyHit(lease({ state: 'reserved', ownerBootId: 'boot-CURRENT' }), 'boot-CURRENT', empty);
-    expect(d.kind).toBe('reuse');
+    expect(d.kind).toBe('terminal');
   });
 
   it('reserved + older boot → takeover (provably pre-dispatch, safe to rerun)', () => {
@@ -183,5 +210,97 @@ describe('reconcileIdempotencyLeasesOnBoot (crash convergence)', () => {
     expect(asyncTriggerStore.lookup('sess-other', 'trg_other')).toBeUndefined();
     expect(mockCloseSession).not.toHaveBeenCalled();
     expect(quarantined.size).toBe(0);
+  });
+
+  it('FINDING #3: a FOREIGN completed on our attempting lease is NOT trusted as convergence, and does NOT abort startup', async () => {
+    // Bot B occupies our sessionId/triggerId async slot with a completed record
+    // (globally-unique sessionId ⇒ adversarial/corrupt). Reconcile must: (a) NOT
+    // treat that foreign completed as our lease converging good (no early
+    // continue), (b) NOT clobber B's evidence, and (c) NOT abort A's startup over
+    // it (that would be the finding-#4 cross-bot DoS shape). At-most-once still
+    // holds: our orphan is quarantined + closed, and the retry/poll paths
+    // owner-gate the foreign record independently.
+    const { record } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-fc', triggerId: 'trg_fc', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-fc', now: 1 }) as any;
+    idempotencyStore.transition(OWNER, 'k-fc', record, { state: 'attempting', now: 2 });
+    asyncTriggerStore.recordCompleted('sess-fc', 'trg_fc', 'B answer', 100, 'cli_OTHER_BOT');
+    sessionRows.set('sess-fc', { sessionId: 'sess-fc', status: 'open' });
+
+    // Does NOT throw (no startup abort).
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
+
+    // B's evidence is byte-untouched (owner-proof refused to clobber; we skipped).
+    const rec = asyncTriggerStore.lookup('sess-fc', 'trg_fc');
+    expect(rec?.result.status).toBe('completed');
+    expect(rec?.result.content).toBe('B answer');
+    expect(rec?.ownerLarkAppId).toBe('cli_OTHER_BOT');
+    // Our orphan was still quarantined + closed (didn't `continue` on foreign completed).
+    expect(quarantined.has('sess-fc')).toBe(true);
+    expect(mockCloseSession).toHaveBeenCalledWith('sess-fc');
+  });
+
+  it('FINDING #2: a reserved snapshot that ADVANCED to attempting under the CAS is reclassified (terminalized), not declared converged', async () => {
+    // The race: listAllForOwner snapshots the lease as reserved-rev1; then it
+    // advances to attempting-rev2 (a concurrent barrier crossing) BEFORE
+    // compareAndRemoveByPath re-reads. The CAS returns changed(current=attempting);
+    // reconcile must terminalize it, NOT silently declare the sweep converged and
+    // leave a running poller. We inject the "advanced under us" by spying
+    // listAllForOwner to hand back the stale reserved snapshot while disk holds
+    // the advanced attempting record.
+    const { record: reservedSnap } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-adv', triggerId: 'trg_adv', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-adv', now: 1 }) as any;
+    const { file } = idempotencyStore.listAllForOwner(OWNER)[0];
+    // Advance the ON-DISK record to attempting-rev2 (the concurrent crossing).
+    idempotencyStore.transition(OWNER, 'k-adv', reservedSnap, { state: 'attempting', now: 5 });
+    sessionRows.set('sess-adv', { sessionId: 'sess-adv', status: 'open' });
+    // Reconcile enumerates the STALE reserved snapshot (pre-advance).
+    const listSpy = vi.spyOn(idempotencyStore, 'listAllForOwner').mockReturnValue([{ file, record: reservedSnap }]);
+
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
+    listSpy.mockRestore();
+
+    // Reclassified as a crossed fence → durable dispatch_unknown + quarantine + close.
+    const rec = asyncTriggerStore.lookup('sess-adv', 'trg_adv');
+    expect(rec?.result.status).toBe('failed');
+    expect(rec?.result.reason).toBe('dispatch_unknown');
+    expect(quarantined.has('sess-adv')).toBe(true);
+    expect(mockCloseSession).toHaveBeenCalledWith('sess-adv');
+    // The attempting fence on disk was NEVER deleted by the stale reserved snapshot.
+    expect(idempotencyStore.lookup(OWNER, 'k-adv')?.state).toBe('attempting');
+  });
+
+  it('FINDING #2: a reserved snapshot whose disk record CHANGED to a foreign-boot reserved (concurrent takeover) fails the reconcile closed', async () => {
+    // If the on-disk lease changed to something we cannot prove converged (a
+    // different reserved revision/boot — e.g. a concurrent takeover), reconcile
+    // must NOT declare success; it throws so startup aborts.
+    const { record: reservedSnap } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-cc', triggerId: 'trg_cc', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-cc', now: 1 }) as any;
+    const { file } = idempotencyStore.listAllForOwner(OWNER)[0];
+    // Disk advances to a DIFFERENT reserved lease (takeover by another old boot).
+    idempotencyStore.takeover({ ownerLarkAppId: OWNER, key: 'k-cc', expect: reservedSnap, sessionId: 'sess-cc2', triggerId: 'trg_cc2', requestHash: 'h', ownerBootId: 'boot-OLD2', now: 6 });
+    const listSpy = vi.spyOn(idempotencyStore, 'listAllForOwner').mockReturnValue([{ file, record: reservedSnap }]);
+
+    await expect(reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession)).rejects.toThrow();
+    listSpy.mockRestore();
+  });
+
+  it('FINDING #2: a corrupt OWN lease makes the whole reconcile throw (fail-closed, aborts startup)', async () => {
+    idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-good', triggerId: 'trg_good', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-good', now: 1 });
+    // Corrupt a file inside OUR owner subdir.
+    const ownerSub = createHash('sha256').update(OWNER).digest('hex');
+    writeFileSync(join(tempDir, 'idempotency', ownerSub, 'deadbeef.json'), '{ corrupt', 'utf-8');
+    await expect(reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession)).rejects.toThrow();
+  });
+
+  it('FINDING #4: a FOREIGN corrupt lease does NOT block our reconcile (no cross-bot startup DoS)', async () => {
+    idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-ours', triggerId: 'trg_ours', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-ours', now: 1 });
+    sessionRows.set('sess-ours', { sessionId: 'sess-ours', status: 'open' });
+    // Another bot's corrupt lease under ITS subdir.
+    const foreignSub = createHash('sha256').update('cli_FOREIGN').digest('hex');
+    mkdirSync(join(tempDir, 'idempotency', foreignSub), { recursive: true });
+    writeFileSync(join(tempDir, 'idempotency', foreignSub, 'garbage.json'), '{ not json', 'utf-8');
+
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
+
+    // Our reserved orphan converged; the foreign corruption was never opened.
+    expect(idempotencyStore.lookup(OWNER, 'k-ours')).toBeUndefined();
+    expect(quarantined.has('sess-ours')).toBe(true);
   });
 });

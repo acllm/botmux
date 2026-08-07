@@ -184,28 +184,64 @@ export function resolveIdempotencyHit(
   activeSessions: Map<string, DaemonSession>,
 ): IdempotencyHitDecision {
   const live = activeBySessionId(activeSessions, hit.sessionId);
-  const chatId = live?.chatId ?? sessionStore.getSession(hit.sessionId)?.chatId ?? '';
-  const outcome = asyncTriggerStore.lookup(hit.sessionId, hit.triggerId)?.result.status;
+  // Owner-scoped session read: getOwnedSession returns a row ONLY from this
+  // process's own bot store, never another bot's sessions-*.json (getSession's
+  // cross-file fallback could surface a foreign session and leak its chatId —
+  // codex #776 round-4 finding #3).
+  const chatId = live?.chatId ?? sessionStore.getOwnedSession(hit.sessionId)?.chatId ?? '';
+  // Terminal async evidence is only trustworthy when it was written by the SAME
+  // owner as the lease. A cross-bot write to the same sessionId/triggerId (codex
+  // deterministically reproduced B's completed suppressing A's dispatch) is
+  // IGNORED — we fall through to this owner's lease state rather than adopt a
+  // foreign terminal. The idempotency async record is always owner-stamped
+  // (beginAsyncTrigger → recordPending with ds.larkAppId; reconcile's
+  // recordFailedStrict requires an owner), so requiring a match never rejects a
+  // legitimate own record, and an unstamped legacy record is correctly not
+  // trusted (a new idempotency turn has no unstamped evidence of its own).
+  const asyncRec = asyncTriggerStore.lookup(hit.sessionId, hit.triggerId);
+  let ownedOutcome: 'pending' | 'completed' | 'failed' | undefined;
+  if (asyncRec) {
+    if (asyncRec.ownerLarkAppId === hit.ownerLarkAppId) {
+      ownedOutcome = asyncRec.result.status;
+    } else {
+      logger.warn(`[idempotency] ignoring foreign async evidence for ${hit.sessionId}/${hit.triggerId}: record owner=${asyncRec.ownerLarkAppId ?? '(unstamped)'} != lease owner=${hit.ownerLarkAppId}`);
+    }
+  }
   // Durable terminal evidence wins over lease state (completed > failed).
-  if (outcome === 'completed') {
+  if (ownedOutcome === 'completed') {
     return { kind: 'reuse', chatId, message: 'idempotency key already completed; reuse the session (poll trigger-result)' };
   }
-  if (outcome === 'failed') {
+  if (ownedOutcome === 'failed') {
     return { kind: 'terminal', chatId, message: 'previous dispatch outcome is unknown (ambiguous crash); not re-run (at-most-once)' };
   }
   if (hit.state === 'attempting') {
-    if (hit.ownerBootId === ownerBootId || live) {
-      // Owner still advancing, or a live worker is genuinely running the turn.
+    // Ground truth for "genuinely in flight" is a LIVE worker, NOT ownerBootId.
+    // A dispatched turn stays registered in activeSessions from creation (before
+    // the barrier) until closeSession, so a real in-flight turn is always live —
+    // regardless of which boot claimed it. Conversely a same-boot `attempting`
+    // lease with NO live worker is an ORPHAN: the barrier-fail release couldn't
+    // delete a crossed fence (EIO / post-rename fsync throw), or the session was
+    // closed without durable terminal evidence. Reusing it would poll a closed
+    // session forever until the next boot's reconcile (codex #776 finding #1
+    // reuse-forever). Treat any not-live attempting as terminal (at-most-once:
+    // never re-dispatch); reconcile / the poll-side resolver make it durable.
+    if (live) {
       return { kind: 'reuse', chatId, message: 'idempotency key in flight; reuse the session (poll trigger-result)' };
     }
-    // attempting by a dead boot with NO terminal evidence yet: the reconcile
-    // (or the poll-side resolver) will terminalize it; treat as terminal here so
-    // a retry never re-dispatches. Boot reconcile writes the durable failed.
     return { kind: 'terminal', chatId, message: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)' };
   }
   // reserved
   if (hit.ownerBootId === ownerBootId) {
-    return { kind: 'reuse', chatId, message: 'idempotency key reserved and being dispatched; reuse the session' };
+    // Same-boot reserved: mid-dispatch in THIS process (between claim and barrier)
+    // only if the session is still live. A not-live same-boot reserved lease is an
+    // abandoned pre-dispatch orphan (barrier-fail release hit EIO and couldn't
+    // prove removal) — fail-closed to terminal so a retry never reuses the closed
+    // session forever (codex #776 finding #1 case 1a). The still-reserved lease is
+    // swept by the next boot's reconcile; retries stay terminal until then.
+    if (live) {
+      return { kind: 'reuse', chatId, message: 'idempotency key reserved and being dispatched; reuse the session' };
+    }
+    return { kind: 'terminal', chatId, message: 'previous reservation was abandoned pre-dispatch with unknown outcome; not re-run (at-most-once)' };
   }
   return { kind: 'takeover' };
 }
@@ -229,7 +265,7 @@ export function resolveIdempotencyHit(
 export async function reconcileIdempotencyLeasesOnBoot(
   ownerLarkAppId: string,
   currentBootId: string,
-  getSession: (id: string) => { chatId?: string } | undefined = sessionStore.getSession,
+  getSession: (id: string) => { chatId?: string } | undefined = sessionStore.getOwnedSession,
 ): Promise<Set<string>> {
   const now = Date.now();
   const quarantined = new Set<string>();
@@ -239,13 +275,45 @@ export async function reconcileIdempotencyLeasesOnBoot(
   // let a poller hang `running` or an orphan re-attach. We finish the sweep to
   // converge everything we can, but remember the first hard failure and rethrow.
   let hardFailure: Error | undefined;
-  const leases = idempotencyStore.listAll({ throwOnCorrupt: true }); // corrupt → throw (unprovable)
+  // Owner-PARTITIONED enumeration: read only THIS bot's subdir. A foreign bot's
+  // corrupt lease lives under a different owner subdir and is never opened here,
+  // so it can't abort this owner's startup (finding #4). A corrupt lease under
+  // OUR OWN owner still throws (unprovable → fail-closed).
+  const leases = idempotencyStore.listAllForOwner(ownerLarkAppId, { throwOnCorrupt: true });
+  // Terminalize an attempting/commit-unknown lease authoritatively into the
+  // async store. THROWS only on a GENUINE I/O failure (caught below →
+  // fail-closed). A destination async slot owned by ANOTHER bot is NOT an I/O
+  // failure and must NOT abort this bot's startup: it's a globally-unique
+  // sessionId colliding with a foreign record (adversarial/corrupt — can't happen
+  // benignly). We must not clobber their evidence, and we don't need to: the
+  // retry path is already at-most-once via resolveIdempotencyHit (not-live
+  // attempting → terminal) and the poll path drops foreign persisted results
+  // (decideAsyncOwnership positive-proof gate). Aborting startup there would be
+  // the same cross-bot DoS shape as finding #4. So skip the durable write for a
+  // foreign slot; the caller still quarantines + closes OUR orphan session.
+  const terminalizeAttempting = (rec: idempotencyStore.IdempotencyRecord): void => {
+    const dest = asyncTriggerStore.lookup(rec.sessionId, rec.triggerId);
+    if (dest?.ownerLarkAppId && dest.ownerLarkAppId !== ownerLarkAppId) {
+      logger.warn(`[idempotency] reconcile NOT terminalizing ${rec.sessionId}/${rec.triggerId}: async slot owned by ${dest.ownerLarkAppId} (foreign) — at-most-once held via lease + poll owner-gate, not aborting startup`);
+      return;
+    }
+    asyncTriggerStore.recordFailedStrict(rec.sessionId, rec.triggerId, now, ownerLarkAppId, 'dispatch_unknown');
+  };
   for (const { file, record } of leases) {
-    // Owner scoping (fail-closed) + skip current boot's own in-flight leases.
+    // Defensive re-check (listAllForOwner already filtered) + skip current boot's
+    // own in-flight leases.
     if (record.ownerLarkAppId !== ownerLarkAppId) continue;
     if (record.ownerBootId === currentBootId) continue;
     try {
-      const outcome = asyncTriggerStore.lookup(record.sessionId, record.triggerId)?.result.status;
+      // Trust async terminal evidence ONLY when it was written by THIS owner. A
+      // foreign completed/failed on the same sessionId/triggerId must NOT let us
+      // declare this owner's lease converged (codex #776 round-4 finding #3):
+      // ignore it and fall through to lease-state handling.
+      const asyncRec = asyncTriggerStore.lookup(record.sessionId, record.triggerId);
+      const outcome = (asyncRec && asyncRec.ownerLarkAppId === ownerLarkAppId) ? asyncRec.result.status : undefined;
+      if (asyncRec && asyncRec.ownerLarkAppId !== ownerLarkAppId) {
+        logger.warn(`[idempotency] reconcile ignoring foreign async evidence for ${record.sessionId}/${record.triggerId}: record owner=${asyncRec.ownerLarkAppId ?? '(unstamped)'} != ${ownerLarkAppId}`);
+      }
       if (outcome === 'completed') continue; // converged good; retry reuses + polls
       if (outcome === 'failed') {
         // Already durable-failed, but a PREVIOUS boot may have crashed after
@@ -258,22 +326,43 @@ export async function reconcileIdempotencyLeasesOnBoot(
       if (record.state === 'attempting') {
         // Write the authoritative terminal FIRST (throws on I/O failure), THEN
         // quarantine + close. Quarantine happens regardless of close success.
-        asyncTriggerStore.recordFailedStrict(record.sessionId, record.triggerId, now, ownerLarkAppId, 'dispatch_unknown');
+        terminalizeAttempting(record);
         quarantined.add(record.sessionId);
         if (getSession(record.sessionId)) await closeSession(record.sessionId);
         continue;
       }
       // reserved: provably never dispatched → CAS-remove by path (only if the
-      // on-disk record is still this exact reserved snapshot — never delete a
-      // fence that advanced to attempting), + close the empty session.
-      idempotencyStore.compareAndRemoveByPath(file, record);
+      // on-disk record is still this exact reserved snapshot). A discriminated
+      // result (not a swallowed boolean) so we react to a lease that ADVANCED
+      // under us instead of declaring the sweep converged (finding #2):
+      //  - removed / absent → converged; quarantine + close the empty session.
+      //  - changed → the lease moved between our snapshot and the CAS re-read.
+      //    Reclassify by its CURRENT state: an `attempting` now is a crossed
+      //    commit-unknown barrier → terminalize (never delete). A current-boot
+      //    re-claim → leave it (in-flight). Anything else (still reserved but a
+      //    different revision/older-boot, i.e. a concurrent takeover) is not
+      //    provably converged → fail-closed.
+      //    (corrupt / EIO inside the CAS THROWS — caught below → fail-closed.)
+      const rm = idempotencyStore.compareAndRemoveByPath(file, record);
+      if (rm.kind === 'changed') {
+        const cur = rm.current;
+        if (cur.ownerBootId === currentBootId) continue; // re-claimed by us → in-flight, untouched
+        if (cur.state === 'attempting') {
+          terminalizeAttempting(cur);
+          quarantined.add(record.sessionId);
+          if (getSession(record.sessionId)) await closeSession(record.sessionId);
+          continue;
+        }
+        throw new Error(`reserved lease changed under reconcile CAS (now rev ${cur.revision} state ${cur.state} boot ${cur.ownerBootId}); cannot prove convergence`);
+      }
       quarantined.add(record.sessionId);
       if (getSession(record.sessionId)) await closeSession(record.sessionId);
     } catch (err) {
       // This lease could not be converged (strict-failed write threw, CAS-remove
-      // threw on EIO, or close threw). Do NOT skip-and-continue as "handled":
-      // record it and keep the session quarantined so restore can't revive it,
-      // then fail the whole reconcile after the sweep.
+      // threw on EIO/corruption, changed-under-us, or close threw). Do NOT
+      // skip-and-continue as "handled": record it and keep the session
+      // quarantined so restore can't revive it, then fail the whole reconcile
+      // after the sweep.
       quarantined.add(record.sessionId);
       const e = err as Error;
       logger.error(`[idempotency] reconcile could not converge lease for ${record.sessionId}: ${e.message}`);
@@ -1028,17 +1117,63 @@ export async function triggerSessionTurn(
     // Commit-unknown barrier: CAS the lease reserved→attempting durably BEFORE
     // beginAsyncTrigger / forkWorker touch the worker.
     // BEFORE the barrier (still `reserved`, provably no dispatch): a failure here
-    // must RELEASE our reserved lease (compare-and-remove) so a same-key retry
-    // can start fresh — otherwise ownerBootId===current makes the retry reuse a
-    // closed session forever (finding #5a).
+    // must truly CONVERGE the lease so a same-key retry does the right thing —
+    // never leaving a current-boot lease bound to the session we're about to
+    // close (resolveIdempotencyHit would otherwise reuse it and hang the poller).
+    // No fork has happened yet, so at-most-once is trivially safe on this path;
+    // the only goal is convergence (finding #1: the old catch swallowed both the
+    // `changed` result AND an EIO throw as "best-effort success").
     try {
       markAttemptingBeforeDispatch();
     } catch (err) {
+      // Did we durably terminalize a CROSSED fence here? If so we can return an
+      // observable terminal `failed` (the caller polls it) rather than a bare
+      // 5xx — codex #776 finding #1: "若已 attempting 则 durable terminalize …
+      // 真正收敛 … 而不是 close 后返回普通 5xx".
+      let terminalizedCrossedFence = false;
       if (idempotencyKey && idempotencyLease) {
-        try { idempotencyStore.compareAndRemove(larkAppId, idempotencyKey, idempotencyLease); } catch { /* best-effort release */ }
+        try {
+          // idempotencyLease is still the pre-transition `reserved` snapshot
+          // (markAttemptingBeforeDispatch only reassigns it on success).
+          const rm = idempotencyStore.compareAndRemove(larkAppId, idempotencyKey, idempotencyLease);
+          if (rm.kind === 'changed' && rm.current.state === 'attempting') {
+            // The rename landed but a post-rename fsync threw: the disk is now a
+            // CROSSED commit-unknown fence. Never delete it — durably terminalize
+            // so a retry resolves `failed` (at-most-once), not reuse-forever.
+            asyncTriggerStore.recordFailedStrict(session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
+            terminalizedCrossedFence = true;
+          } else if (rm.kind === 'changed') {
+            // Changed to something other than attempting (a concurrent takeover /
+            // CAS by another flow): not ours to converge — leave it.
+            logger.warn(`[idempotency] barrier-fail release saw the lease change (rev ${rm.current.revision} state ${rm.current.state}); leaving it for reconcile`);
+          }
+          // removed / absent → cleanly released; a same-key retry starts fresh.
+        } catch (e) {
+          // Either compareAndRemove THREW (corrupt re-read / EIO unlink) or the
+          // crossed-fence recordFailedStrict THREW (double fault): the store state
+          // is unprovable / not durably terminal. Leave the lease for next-boot
+          // reconcile; the same-boot-needs-live guard in resolveIdempotencyHit
+          // stops a reuse-forever before then (finding #1: unprovable ≠ silent
+          // success). Fall through to the honest 5xx.
+          logger.error(`[idempotency] barrier-fail release could not converge the lease (${(e as Error).message}); left for reconcile`);
+        }
       }
       await closeSession(session.sessionId);
-      return { ok: false, errorCode: 'trigger_failed', error: `idempotency attempt-barrier failed: ${(err as Error).message}` };
+      if (terminalizedCrossedFence) {
+        // Observable terminal: the caller can poll this sessionId and get `failed`.
+        return {
+          ok: false, state: 'failed', triggerId,
+          errorCode: 'no_output',
+          error: `idempotency attempt-barrier crossed then failed; outcome unknown (at-most-once, not re-run): ${(err as Error).message}`,
+          target: { kind: 'turn', sessionId: session.sessionId, chatId },
+          idempotencyKey, idempotent: false,
+        };
+      }
+      return {
+        ok: false, errorCode: 'trigger_failed',
+        error: `idempotency attempt-barrier failed: ${(err as Error).message}`,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+      };
     }
     // AFTER the barrier (now `attempting`, commit-unknown): any synchronous throw
     // from beginAsyncTrigger/prepare/forkWorker must NOT leave the caller polling

@@ -51,6 +51,7 @@ vi.mock('../src/services/session-store.js', () => ({
   }),
   updateSession: vi.fn(),
   getSession: vi.fn((id: string) => createdSessions.find(s => s.sessionId === id)),
+  getOwnedSession: vi.fn((id: string) => createdSessions.find(s => s.sessionId === id)),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -181,5 +182,82 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(res.ok).toBe(false);
     expect(res.state).not.toBe('failed');       // no phantom terminal
     expect(res.errorCode).toBe('trigger_failed'); // honest 5xx-class hard error
+  });
+
+  // ── codex #776 finding #1: attempt-barrier (transition reserved→attempting)
+  //    fault. The barrier-fail release must genuinely CONVERGE the lease — not
+  //    swallow a `changed`/EIO — so a same-boot retry does the right thing.
+  //    Two disk states codex named: pre-rename (disk still reserved) and
+  //    post-rename (disk landed attempting, then fsync threw).
+
+  it('barrier PRE-rename fault (transition throws, disk still reserved) → 5xx; same-key retry starts FRESH (re-forks once)', async () => {
+    const shared = new Map(); // real daemon shares ONE activeSessions map across calls
+    // First call: make the barrier transition throw WITHOUT mutating disk (the
+    // lease stays `reserved`). Barrier-fail release must cleanly compareAndRemove
+    // it so the retry is not blocked by a same-boot reserved orphan.
+    const spy = vi.spyOn(idempotencyStore, 'transition').mockImplementationOnce(() => { throw new Error('injected pre-rename barrier fault'); });
+    const first = await triggerSessionTurn(freshAsyncReq('k-bpre'), { larkAppId: APP, activeSessions: shared });
+    expect(first.ok).toBe(false);
+    expect(first.errorCode).toBe('trigger_failed');
+    expect(mockForkWorker).not.toHaveBeenCalled(); // barrier failed before fork
+    // Lease was released (clean reserved removal) — no leftover blocking the key.
+    expect(idempotencyStore.lookup(APP, 'k-bpre')).toBeUndefined();
+    spy.mockRestore();
+    // Retry: real transition now works → fresh claim + one fork + attempting lease.
+    const retry = await triggerSessionTurn(freshAsyncReq('k-bpre'), { larkAppId: APP, activeSessions: shared });
+    expect(retry.ok).toBe(true);
+    expect(retry.idempotent).toBe(false);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1); // exactly one fork total
+    expect(idempotencyStore.lookup(APP, 'k-bpre')?.state).toBe('attempting');
+  });
+
+  it('barrier POST-rename fault (disk landed attempting, then throw) → observable durable failed; same-key retry does NOT re-fork', async () => {
+    // Simulate the rename landing (disk becomes attempting) THEN a post-rename
+    // fsync throw: advance the real on-disk lease to attempting, then throw. The
+    // barrier-fail release sees compareAndRemove→changed(attempting) and must
+    // durably terminalize (never delete the crossed fence) AND report an
+    // observable terminal (state:failed with the sessionId), not a bare 5xx.
+    const realTransition = idempotencyStore.transition;
+    const spy = vi.spyOn(idempotencyStore, 'transition').mockImplementationOnce((owner: any, key: any, from: any, patch: any) => {
+      realTransition(owner, key, from, patch); // rename lands: disk now attempting
+      throw new Error('injected post-rename barrier fault (fsync)');
+    });
+    const first = await triggerSessionTurn(freshAsyncReq('k-bpost'), { larkAppId: APP, activeSessions: new Map() });
+    spy.mockRestore();
+    expect(first.ok).toBe(false);
+    expect(first.state).toBe('failed');            // observable terminal, not bare 5xx
+    expect(first.errorCode).toBe('no_output');
+    expect(mockForkWorker).not.toHaveBeenCalled(); // threw before fork
+    const sid = first.target!.sessionId!;
+    // The crossed fence was durably terminalized (dispatch_unknown), NOT deleted.
+    expect(asyncTriggerStore.lookup(sid, first.triggerId!)?.result.status).toBe('failed');
+    expect(asyncTriggerStore.lookup(sid, first.triggerId!)?.result.reason).toBe('dispatch_unknown');
+    // Retry with the same key resolves TERMINAL (at-most-once) — never re-forks.
+    const retry = await triggerSessionTurn(freshAsyncReq('k-bpost'), { larkAppId: APP, activeSessions: new Map() });
+    expect(retry.state).toBe('failed');
+    expect(mockForkWorker).not.toHaveBeenCalled(); // still zero forks
+  });
+
+  it('barrier release compareAndRemove EIO (unprovable) → 5xx; retry stays TERMINAL (not-live orphan, no reuse-forever)', async () => {
+    // Barrier transition throws pre-rename (disk still reserved), but the release
+    // compareAndRemove ALSO throws (EIO) → the lease state is unprovable. We must
+    // NOT reuse-forever: resolveIdempotencyHit's not-live guard makes the retry
+    // terminal (the still-reserved same-boot lease has no live worker in the
+    // persistent map, which evicts on closeSession — modeled here by a fresh map).
+    const tSpy = vi.spyOn(idempotencyStore, 'transition').mockImplementationOnce(() => { throw new Error('injected barrier fault'); });
+    const rSpy = vi.spyOn(idempotencyStore, 'compareAndRemove').mockImplementationOnce(() => { throw new Error('injected EIO on release unlink'); });
+    const first = await triggerSessionTurn(freshAsyncReq('k-beio'), { larkAppId: APP, activeSessions: new Map() });
+    tSpy.mockRestore(); rSpy.mockRestore();
+    expect(first.ok).toBe(false);
+    expect(first.errorCode).toBe('trigger_failed');
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    // The reserved lease is still on disk (release couldn't prove removal)…
+    expect(idempotencyStore.lookup(APP, 'k-beio')?.state).toBe('reserved');
+    // …but the session is not live (closed + persistent map evicts) → retry is
+    // TERMINAL, never reused-forever.
+    const retry = await triggerSessionTurn(freshAsyncReq('k-beio'), { larkAppId: APP, activeSessions: new Map() });
+    expect(retry.state).toBe('failed');
+    expect(retry.idempotent).toBe(true);
+    expect(mockForkWorker).not.toHaveBeenCalled(); // no dispatch on the orphan
   });
 });

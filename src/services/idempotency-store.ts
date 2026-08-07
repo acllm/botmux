@@ -29,7 +29,7 @@
  * caller rolls back the just-created session and returns 5xx before dispatch.
  */
 import { readFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -61,26 +61,39 @@ export class IdempotencyConflictError extends Error {
   }
 }
 
-function getDir(): string {
+function baseDir(): string {
   return join(config.session.dataDir, 'idempotency');
 }
 
-/** Filename = sha256(owner \0 key). NUL separator prevents (a,bc)/(ab,c) collision. */
-function fileFor(ownerLarkAppId: string, key: string): string {
-  const digest = createHash('sha256').update(ownerLarkAppId).update('\0').update(key).digest('hex');
-  return join(getDir(), `${digest}.json`);
+/** Per-owner subdirectory: sha256(owner). Owner-PARTITIONED layout so a boot
+ *  reconcile can enumerate ONLY its own bot's leases — a foreign (other-bot)
+ *  corrupt lease then lives under a different subdir and can never block this
+ *  bot's startup (the filename `sha256(owner\0key)` alone can't recover the
+ *  owner from unparseable JSON, so a flat dir + throwOnCorrupt was a cross-bot
+ *  startup DoS — codex #776 round-4 finding #4). */
+function ownerDir(ownerLarkAppId: string): string {
+  const ownerHash = createHash('sha256').update(ownerLarkAppId).digest('hex');
+  return join(baseDir(), ownerHash);
 }
 
-function ensureDir(): void {
-  const dir = getDir();
+/** Filename = <ownerDir>/sha256(owner \0 key).json. The NUL-separated key digest
+ *  keeps the same collision-free filename; the owner subdir gives partitioning. */
+function fileFor(ownerLarkAppId: string, key: string): string {
+  const digest = createHash('sha256').update(ownerLarkAppId).update('\0').update(key).digest('hex');
+  return join(ownerDir(ownerLarkAppId), `${digest}.json`);
+}
+
+function ensureDirFor(fp: string): void {
+  const dir = dirname(fp);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
-/** Acquire the per-key file lock, ensuring the idempotency dir exists first so
- *  withFileLockSync can create its `<path>.lock` sibling. All mutators route
- *  through here so the lock and the record live in a materialized directory. */
+/** Acquire the per-key file lock, ensuring the record's OWNER subdir exists
+ *  first so withFileLockSync can create its `<path>.lock` sibling there. All
+ *  mutators route through here so the lock and the record live in a
+ *  materialized directory. */
 function withKeyLock<T>(fp: string, fn: () => T): T {
-  ensureDir();
+  ensureDirFor(fp);
   return withFileLockSync(fp, fn);
 }
 
@@ -105,7 +118,7 @@ function readRecord(fp: string): IdempotencyRecord | undefined {
 }
 
 function writeRecord(fp: string, rec: IdempotencyRecord): void {
-  ensureDir();
+  ensureDirFor(fp);
   atomicWriteFileSync(fp, JSON.stringify(rec, null, 2), { durable: true, followTargetSymlink: false });
 }
 
@@ -241,30 +254,29 @@ function strictUnlink(fp: string): void {
 
 /** Compare-and-remove: delete the lease ONLY if it still matches `expect`
  *  (identity + revision + state) under the lock. Used to release a `reserved`
- *  lease we created but abandoned before dispatch. Returns true if removed,
- *  false if the on-disk record changed (someone advanced it) or was already
- *  gone. THROWS on an ambiguous unlink error (EIO/EROFS/…): the caller must be
- *  able to trust that `true` means the lease is truly released. */
-export function compareAndRemove(ownerLarkAppId: string, key: string, expect: IdempotencyRecord): boolean {
-  const fp = fileFor(ownerLarkAppId, key);
-  return withKeyLock(fp, () => {
-    const current = readRecord(fp);
-    if (!current) return false;
-    if (current.revision !== expect.revision || current.state !== expect.state || !sameIdentity(current, expect)) {
-      return false;
-    }
-    strictUnlink(fp); // throws on EIO/EROFS/… (never a silent success)
-    return true;
-  });
+ *  lease we created but abandoned before dispatch. Returns a discriminated
+ *  RemoveByPathResult (removed | absent | changed) — NOT a boolean — so the
+ *  barrier-release caller can tell a clean release (retryable) apart from "the
+ *  disk already advanced to attempting under me" (must durably terminalize, not
+ *  delete) instead of swallowing both (finding #1). A lock-internal re-read
+ *  corruption or an ambiguous unlink error (EIO/EROFS/…) THROWS — the caller
+ *  must be able to trust that `removed` means the lease is truly released. */
+export function compareAndRemove(ownerLarkAppId: string, key: string, expect: IdempotencyRecord): RemoveByPathResult {
+  return compareAndRemoveByPath(fileFor(ownerLarkAppId, key), expect);
 }
 
-/** Enumerate every stored lease (boot reconcile). By default a corrupt file is
- *  logged + skipped. With `throwOnCorrupt`, a corrupt lease THROWS instead — the
- *  reconcile can't prove such a lease converged, so it must fail-closed rather
- *  than silently skip (a skipped corrupt lease could hide an unconverged
- *  attempting fence). */
-export function listAll(opts: { throwOnCorrupt?: boolean } = {}): Array<{ file: string; record: IdempotencyRecord }> {
-  const dir = getDir();
+/** Enumerate the leases owned by a SINGLE bot (boot reconcile is owner-scoped).
+ *  Reads only `idempotency/<sha256(owner)>/` — a foreign bot's corrupt lease
+ *  lives under a different subdir and is never even opened here, so it can't
+ *  block this owner's startup (finding #4). By default a corrupt file under THIS
+ *  owner is logged + skipped; with `throwOnCorrupt`, a corrupt OWN lease THROWS
+ *  (the reconcile can't prove it converged, so it must fail-closed rather than
+ *  silently skip a possibly-unconverged attempting fence). */
+export function listAllForOwner(
+  ownerLarkAppId: string,
+  opts: { throwOnCorrupt?: boolean } = {},
+): Array<{ file: string; record: IdempotencyRecord }> {
+  const dir = ownerDir(ownerLarkAppId);
   if (!existsSync(dir)) return [];
   const out: Array<{ file: string; record: IdempotencyRecord }> = [];
   for (const name of readdirSync(dir)) {
@@ -272,7 +284,9 @@ export function listAll(opts: { throwOnCorrupt?: boolean } = {}): Array<{ file: 
     const fp = join(dir, name);
     try {
       const rec = readRecord(fp);
-      if (rec) out.push({ file: fp, record: rec });
+      // Defence-in-depth: the dir is already owner-partitioned, but a stray file
+      // whose stamped owner disagrees is not ours to touch — skip it.
+      if (rec && rec.ownerLarkAppId === ownerLarkAppId) out.push({ file: fp, record: rec });
     } catch (err) {
       if (opts.throwOnCorrupt) throw new Error(`unreadable idempotency lease ${fp}: ${(err as Error).message}`);
       logger.warn(`[idempotency] skipping unreadable lease ${fp}: ${err}`);
@@ -281,23 +295,40 @@ export function listAll(opts: { throwOnCorrupt?: boolean } = {}): Array<{ file: 
   return out;
 }
 
+/** Result of a reconcile-time compare-and-remove-by-path:
+ *  - removed:  on-disk record matched the snapshot and was deleted (converged).
+ *  - absent:   nothing on disk (already gone — converged, nothing to do).
+ *  - changed:  the record advanced/changed under us (carries the CURRENT record
+ *              so the reconcile can RECLASSIFY it by its real state/boot instead
+ *              of falsely declaring the sweep converged). */
+export type RemoveByPathResult =
+  | { kind: 'removed' }
+  | { kind: 'absent' }
+  | { kind: 'changed'; current: IdempotencyRecord };
+
 /** Reconcile-only compare-and-remove BY PATH (reconcile enumerated the file via
- *  listAll and holds a snapshot record; the plaintext key isn't recoverable from
- *  the hashed filename). Re-reads under the lock and removes ONLY if the on-disk
- *  record still matches the snapshot's full identity + revision + state — so a
- *  stale reserved snapshot can NOT delete a fence that has since advanced to
- *  `attempting` (finding: old sweep erasing a crossed commit-unknown barrier).
- *  Returns true iff removed. THROWS on an ambiguous unlink error. */
-export function compareAndRemoveByPath(fp: string, expect: IdempotencyRecord): boolean {
+ *  listAllForOwner and holds a snapshot record; the plaintext key isn't
+ *  recoverable from the hashed filename). Re-reads under the lock and removes
+ *  ONLY if the on-disk record still matches the snapshot's full identity +
+ *  revision + state — so a stale reserved snapshot can NOT delete a fence that
+ *  has since advanced to `attempting` (finding: old sweep erasing a crossed
+ *  commit-unknown barrier).
+ *
+ *  Returns a discriminated result rather than a boolean so the reconcile can
+ *  tell "converged (removed/absent)" apart from "changed under me" and act on
+ *  the latter (finding #2: a bare `false` folded both the changed case AND a
+ *  lock-internal corruption into a single value the caller ignored, declaring a
+ *  non-convergence a success). A lock-internal re-read corruption or an
+ *  ambiguous unlink error THROWS (fail-closed — the reconcile aborts startup
+ *  rather than bind while a lease is in an unprovable state). */
+export function compareAndRemoveByPath(fp: string, expect: IdempotencyRecord): RemoveByPathResult {
   return withKeyLock(fp, () => {
-    let current: IdempotencyRecord | undefined;
-    try { current = readRecord(fp); }
-    catch { return false; } // corrupt now → leave it for a human, never blind-delete
-    if (!current) return false;
+    const current = readRecord(fp); // corrupt now → THROWS (never blind-delete, never fold to a success)
+    if (!current) return { kind: 'absent' };
     if (current.revision !== expect.revision || current.state !== expect.state || !sameIdentity(current, expect)) {
-      return false; // advanced/changed under us — keep it
+      return { kind: 'changed', current }; // advanced/changed under us — hand it back for reclassification
     }
-    strictUnlink(fp);
-    return true;
+    strictUnlink(fp); // throws on EIO/EROFS/… (never a silent success)
+    return { kind: 'removed' };
   });
 }

@@ -9,9 +9,10 @@
  * Run:  pnpm vitest run test/idempotency-store.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readdirSync, readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 
 let tempDir: string;
 
@@ -23,7 +24,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
-  claim, transition, takeover, lookup, compareAndRemove, listAll, compareAndRemoveByPath,
+  claim, transition, takeover, lookup, compareAndRemove, listAllForOwner, compareAndRemoveByPath,
   IdempotencyConflictError,
   type IdempotencyRecord,
 } from '../src/services/idempotency-store.js';
@@ -67,10 +68,12 @@ describe('claim', () => {
 
   it('FAIL-CLOSED: a corrupt existing record throws (never treated as absent)', () => {
     claim(base());
-    // Corrupt the single stored file.
-    const files = readdirSync(tempDir + '/idempotency').filter(f => f.endsWith('.json'));
+    // Corrupt the single stored file (now under an owner subdir).
+    const idemRoot = join(tempDir, 'idempotency');
+    const ownerSub = readdirSync(idemRoot).find(n => !n.endsWith('.json'))!; // sha256(owner) dir
+    const files = readdirSync(join(idemRoot, ownerSub)).filter(f => f.endsWith('.json'));
     expect(files.length).toBe(1);
-    writeFileSync(join(tempDir, 'idempotency', files[0]), '{ not json', 'utf-8');
+    writeFileSync(join(idemRoot, ownerSub, files[0]), '{ not json', 'utf-8');
     expect(() => claim(base())).toThrow();
     expect(() => lookup('cli_a', 'k1')).toThrow();
   });
@@ -88,8 +91,9 @@ describe('transition (CAS)', () => {
   it('rejects a stale-revision writer (CAS conflict)', () => {
     const { record } = claim(base()) as { record: IdempotencyRecord };
     transition('cli_a', 'k1', record, { state: 'attempting', now: 2000 }); // rev→2
-    // Second writer still holding rev-1 record must fail.
-    expect(() => transition('cli_a', 'k1', record, { state: 'terminal', outcome: 'dispatch_unknown', now: 3000 }))
+    // Second writer still holding rev-1 record must fail (no valid re-transition
+    // of a stale snapshot; the store has only reserved|attempting).
+    expect(() => transition('cli_a', 'k1', record, { state: 'attempting', now: 3000 }))
       .toThrow(/CAS conflict/);
   });
 });
@@ -144,48 +148,84 @@ describe('takeover (older-boot reserved) — returns won|existing', () => {
   });
 });
 
-describe('reconcile enumeration', () => {
-  it('listAll returns every stored lease with its file path', () => {
+describe('reconcile enumeration (owner-partitioned)', () => {
+  it('listAllForOwner returns every stored lease for that owner with its file path', () => {
     claim(base({ key: 'k1', sessionId: 's1' }));
     claim(base({ key: 'k2', sessionId: 's2' }));
-    const all = listAll();
+    const all = listAllForOwner('cli_a');
     expect(all.length).toBe(2);
     expect(all.map(a => a.record.sessionId).sort()).toEqual(['s1', 's2']);
     expect(all.every(a => a.file.endsWith('.json'))).toBe(true);
   });
 
+  it('listAllForOwner returns ONLY the queried owner (cross-bot partition)', () => {
+    claim(base({ ownerLarkAppId: 'cli_a', key: 'k', sessionId: 'sa' }));
+    claim(base({ ownerLarkAppId: 'cli_b', key: 'k', sessionId: 'sb' }));
+    expect(listAllForOwner('cli_a').map(a => a.record.sessionId)).toEqual(['sa']);
+    expect(listAllForOwner('cli_b').map(a => a.record.sessionId)).toEqual(['sb']);
+  });
+
   it('compareAndRemoveByPath drops a lease only if the on-disk record still matches the snapshot', () => {
     claim(base());
-    const { file, record } = listAll()[0];
-    // Stale snapshot (advanced to attempting under us) → must NOT delete the fence.
+    const { file, record } = listAllForOwner('cli_a')[0];
+    // Stale snapshot (advanced to attempting under us) → must NOT delete the fence;
+    // returns changed(current=the attempting record) so the caller can reclassify.
     transition('cli_a', 'k1', record, { state: 'attempting', now: 5000 }); // rev2 attempting
-    expect(compareAndRemoveByPath(file, record)).toBe(false); // record is the rev1 reserved snapshot
+    const stale = compareAndRemoveByPath(file, record); // record is the rev1 reserved snapshot
+    expect(stale.kind).toBe('changed');
+    if (stale.kind === 'changed') expect(stale.current.state).toBe('attempting');
     expect(lookup('cli_a', 'k1')?.state).toBe('attempting'); // fence preserved (codex repro)
     // Exact match → removed.
     const current = lookup('cli_a', 'k1')!;
-    expect(compareAndRemoveByPath(file, current)).toBe(true);
+    expect(compareAndRemoveByPath(file, current).kind).toBe('removed');
     expect(lookup('cli_a', 'k1')).toBeUndefined();
+    // Absent now → absent (not an error, not a phantom removed).
+    expect(compareAndRemoveByPath(file, current).kind).toBe('absent');
   });
 
-  it('listAll skips (does not throw on) a corrupt file', () => {
+  it('compareAndRemoveByPath THROWS on a lock-internal corrupt re-read (never folds to a success)', () => {
+    claim(base());
+    const { file, record } = listAllForOwner('cli_a')[0];
+    writeFileSync(file, '{ corrupt after snapshot', 'utf-8'); // corrupted between list and CAS
+    expect(() => compareAndRemoveByPath(file, record)).toThrow();
+    // The corrupt fence is left intact for the human / next reconcile — not deleted.
+    expect(() => lookup('cli_a', 'k1')).toThrow();
+  });
+
+  it('listAllForOwner throwOnCorrupt: OWN corrupt lease throws (fail-closed)', () => {
     claim(base({ key: 'good', sessionId: 'sg' }));
-    writeFileSync(join(tempDir, 'idempotency', 'deadbeef.json'), '{ corrupt', 'utf-8');
-    const all = listAll();
-    expect(all.length).toBe(1);
-    expect(all[0].record.sessionId).toBe('sg');
+    // Drop a corrupt file inside THIS owner's subdir.
+    const ownerSub = createHash('sha256').update('cli_a').digest('hex');
+    writeFileSync(join(tempDir, 'idempotency', ownerSub, 'deadbeef.json'), '{ corrupt', 'utf-8');
+    expect(() => listAllForOwner('cli_a', { throwOnCorrupt: true })).toThrow(/unreadable idempotency lease/);
+    // Without throwOnCorrupt it skips + keeps the good one.
+    const all = listAllForOwner('cli_a');
+    expect(all.map(a => a.record.sessionId)).toEqual(['sg']);
+  });
+
+  it('FINDING #4: a FOREIGN owner corrupt lease does NOT block this owner (no cross-bot startup DoS)', () => {
+    claim(base({ ownerLarkAppId: 'cli_a', key: 'k', sessionId: 'sa' }));
+    // Another bot's corrupt lease lives under ITS OWN owner subdir.
+    const foreignSub = createHash('sha256').update('cli_FOREIGN').digest('hex');
+    mkdirSync(join(tempDir, 'idempotency', foreignSub), { recursive: true });
+    writeFileSync(join(tempDir, 'idempotency', foreignSub, 'garbage.json'), '{ not json', 'utf-8');
+    // cli_a's owner-scoped strict enumeration never even opens the foreign subdir.
+    expect(() => listAllForOwner('cli_a', { throwOnCorrupt: true })).not.toThrow();
+    expect(listAllForOwner('cli_a', { throwOnCorrupt: true }).map(a => a.record.sessionId)).toEqual(['sa']);
   });
 });
 
 describe('compareAndRemove + weird keys', () => {
-  it('compareAndRemove deletes only the exact expected lease; idempotent', () => {
+  it('compareAndRemove deletes only the exact expected lease; idempotent (discriminated result)', () => {
     const { record } = claim(base()) as { record: IdempotencyRecord };
-    // Stale expectation (wrong revision) → no-op.
-    expect(compareAndRemove('cli_a', 'k1', { ...record, revision: 99 })).toBe(false);
+    // Stale expectation (wrong revision) → changed (on-disk still the rev1 reserved).
+    const stale = compareAndRemove('cli_a', 'k1', { ...record, revision: 99 });
+    expect(stale.kind).toBe('changed');
     expect(lookup('cli_a', 'k1')).toBeDefined();
     // Exact match → removed.
-    expect(compareAndRemove('cli_a', 'k1', record)).toBe(true);
+    expect(compareAndRemove('cli_a', 'k1', record).kind).toBe('removed');
     expect(lookup('cli_a', 'k1')).toBeUndefined();
-    expect(compareAndRemove('cli_a', 'k1', record)).toBe(false); // already gone
+    expect(compareAndRemove('cli_a', 'k1', record).kind).toBe('absent'); // already gone
   });
 
   it('tolerates path-traversal / NUL key bytes via hashed filename', () => {

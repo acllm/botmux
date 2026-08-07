@@ -18918,7 +18918,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
     },
-    onCliExit(_ds, context) {
+    onCliExit(ds, context) {
+      // Same idempotent-async convergence as onWorkerExit: the MANAGED CLI can
+      // exit inside a still-live Node worker (persistent-pane / codex-app
+      // auto-restart), in which case onWorkerExit never fires. An incomplete
+      // keyed async turn whose CLI died with no final_output must still converge
+      // to a durable dispatch_unknown, or trigger-result polls `running` and a
+      // same-key retry reuses the dead generation forever (codex #776 round-6
+      // finding #1 — the onCliExit half of that path). Idempotent + generation-
+      // gated: safe under the onCliExit/onWorkerExit double-callback race, and a
+      // no-op once final_output cleared the stamp.
+      convergeIdempotentAsyncTurnOnWorkerExit(ds, context.workerGeneration);
       const result = handleVcMeetingWorkerGenerationExit(context, {
         dataDir: config.session.dataDir,
         selfAppId: cfg.larkAppId,

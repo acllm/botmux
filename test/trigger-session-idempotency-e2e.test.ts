@@ -302,6 +302,50 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(ds.idempotentAsyncTurn).toBeDefined(); // stamp intact
   });
 
+  it('FINDING #3: a FOREIGN completed on the same sessionId does NOT clear the exit-convergence stamp', async () => {
+    // codex round-7 #3: async-trigger-store is keyed by sessionId; a foreign bot's
+    // completed on the same sessionId/triggerId must NOT be treated as OUR
+    // completion and clear our only exit-convergence stamp — else onCliExit leaves
+    // no stamp, resolveIdempotencyHit reuses the attempting lease (foreign outcome
+    // ignored + liveWorker), and the later onWorkerExit — stampless — can never
+    // converge → permanent running. Convergence must still write OUR durable failed
+    // (recordFailedStrict is owner-proofed and would throw on a real foreign-owned
+    // file; here the foreign record is under a DIFFERENT session file, so our write
+    // to our own session succeeds).
+    const shared = new Map();
+    const first = await triggerSessionTurn(freshAsyncReq('k-fc3'), { larkAppId: APP, activeSessions: shared });
+    const sid = first.target!.sessionId!;
+    const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
+    const gen = ds.idempotentAsyncTurn.workerGeneration;
+    // Foreign bot writes a completed on OUR sessionId/triggerId (adversarial /
+    // sessionId collision). ownerLarkAppId != our APP.
+    asyncTriggerStore.recordCompleted(sid, first.triggerId!, 'B answer', 100, 'cli_OTHER_BOT');
+    ds.worker = null;
+    convergeIdempotentAsyncTurnOnWorkerExit(ds, gen);
+    // The foreign completed did NOT count as our completion: convergence attempted
+    // our durable failed. recordFailedStrict is completed-wins + owner-proofed, so
+    // the on-disk foreign completed stays (owner mismatch → our write threw inside,
+    // stamp intact for reconcile). The KEY invariant: the stamp was NOT silently
+    // cleared by the foreign completed.
+    const rec = asyncTriggerStore.lookup(sid, first.triggerId!);
+    expect(rec?.ownerLarkAppId).toBe('cli_OTHER_BOT'); // foreign evidence untouched (owner-proof)
+    expect(ds.idempotentAsyncTurn).toBeDefined();       // stamp NOT cleared by foreign completed
+  });
+
+  it('FINDING #1: keyed at-most-once turn forks with atMostOnce so the worker never replays it after CLI exit', async () => {
+    // codex round-7 #1: the fork must carry atMostOnce so the worker excludes the
+    // input from BOTH inflight carry-over and pendingMessages on CLI exit. Assert
+    // the daemon side passes it (the worker-side no-replay is unit-tested in
+    // inflight-input-tracker + worker restart integration).
+    mockForkWorker.mockClear();
+    await triggerSessionTurn(freshAsyncReq('k-amo'), { larkAppId: APP, activeSessions: new Map() });
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    const forkArg = mockForkWorker.mock.calls[0][2]; // third arg = resumeOrTurnId
+    expect(typeof forkArg).toBe('object');
+    expect(forkArg.atMostOnce).toBe(true);
+    expect(forkArg.turnId).toBeTruthy();
+  });
+
   // ── codex #776 round-6 finding #4: the raw idempotencyKey must NOT leak into
   //    the rendered prompt, or trim-equivalent keys ('k' vs ' k ') would produce
   //    a different prompt while the hash (which excludes the key) matches — a

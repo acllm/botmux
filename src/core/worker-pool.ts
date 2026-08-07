@@ -4137,6 +4137,12 @@ export function forkWorker(
     turnId?: string;
     dispatchAttempt?: number;
     restartAttemptId?: string;
+    /** At-most-once turn (idempotency lease): the worker must NEVER replay this
+     *  input after a CLI exit — not via inflight carry-over, not from the still-
+     *  queued pendingMessages. Once the daemon terminalizes the turn, re-executing
+     *  it on an auto-restarted CLI would violate at-most-once (codex #776 round-7
+     *  finding #1). */
+    atMostOnce?: boolean;
   } = false,
 ): void {
   const gatedPrompt = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
@@ -4211,6 +4217,7 @@ export function forkWorker(
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
   let restartAttemptId: string | undefined;
+  let initAtMostOnce: boolean | undefined;
   if (typeof resumeOrTurnId === 'string') {
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
@@ -4218,6 +4225,7 @@ export function forkWorker(
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
     restartAttemptId = resumeOrTurnId.restartAttemptId;
+    initAtMostOnce = resumeOrTurnId.atMostOnce;
   } else {
     resume = resumeOrTurnId;
   }
@@ -4566,6 +4574,7 @@ export function forkWorker(
     locale: botLocale(botCfg),
     turnId: initAttributionTurnId,
     dispatchAttempt: initDispatchAttempt,
+    ...(initAtMostOnce ? { atMostOnce: true } : {}),
     vcMeetingImTurnOrigin: resolveVcMeetingImTurnOrigin(
       ds.session,
       initAttributionTurnId,

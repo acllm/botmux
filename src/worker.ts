@@ -10134,9 +10134,28 @@ async function spawnCli(
     // onCliExit tells the daemon to mark that receipt ambiguous; replaying the
     // same attempt locally as ordinary carry-over would race hub attempt N+1
     // and execute the prompt twice.
-    const stashed = inflightInputs.onCliExit(item => item.dispatchAttempt === undefined);
+    // At-most-once (idempotency lease) turns are ALSO excluded: the daemon
+    // terminalizes them to dispatch_unknown on this exit, so re-executing on the
+    // auto-restarted CLI would run a turn the caller already saw failed (codex
+    // #776 round-7 finding #1). A keyed fresh-async session is single-turn (its
+    // http_async_ chatId is minted per trigger and the validator scope-lock
+    // forbids a second turn targeting it), so the whole-session init flag is a
+    // sound and complete signal: nothing legitimate is queued behind the keyed
+    // turn to strand.
+    const atMostOnceSession = lastInitConfig?.atMostOnce === true;
+    const stashed = inflightInputs.onCliExit(
+      item => item.dispatchAttempt === undefined && !item.noReplay && !atMostOnceSession,
+    );
     if (stashed > 0) {
       log(`CLI exited with ${stashed} in-flight message(s); will re-queue after restart`);
+    }
+    if (atMostOnceSession && pendingMessages.length > 0) {
+      // Cover BOTH replay queues (codex: inflight carry-over AND still-queued
+      // pendingMessages). A never-written keyed input still sitting here must not
+      // reach the restarted CLI either.
+      const before = pendingMessages.length;
+      pendingMessages.length = 0;
+      log(`Dropped ${before} at-most-once pending message(s) on CLI exit (no replay)`);
     }
     backend = null;
     isPromptReady = false;

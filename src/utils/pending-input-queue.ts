@@ -10,6 +10,14 @@ export interface PendingCliInput {
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
+  /** Per-item at-most-once marker: an input carrying this must NEVER be replayed
+   *  onto an auto-restarted CLI — excluded from both the pendingMessages drain and
+   *  the InflightInputTracker carry-over (codex #776 round-7 finding #1). The
+   *  worker's carry predicate honors it. Today keyed fresh-async turns are
+   *  single-turn and gated by the whole-session `init.atMostOnce` flag, so this
+   *  per-item flag is the finer-grained primitive for any future message-fold
+   *  path that needs the same guarantee without clearing the whole queue. */
+  noReplay?: boolean;
 }
 
 /**

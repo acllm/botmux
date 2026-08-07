@@ -86,6 +86,22 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([{ content: 'ordinary IM', turnId: 'im-1' }]);
   });
 
+  it('at-most-once (noReplay) input is NEVER carried over — the worker exit predicate excludes it', () => {
+    // codex #776 round-7 finding #1: a keyed idempotency turn (dispatchAttempt
+    // undefined, so it would otherwise look like ordinary carry-over) is marked
+    // noReplay. The daemon terminalizes it to dispatch_unknown on CLI exit, so
+    // replaying it onto the auto-restarted CLI would run a turn the caller already
+    // saw failed. The worker's carry predicate is exactly this.
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'ordinary IM', turnId: 'im-1' });
+    t.onWrite({ content: 'keyed async turn', turnId: 'trg_k', noReplay: true });
+
+    // Worker's real predicate: dispatchAttempt===undefined && !noReplay.
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined && !item.noReplay)).toBe(1);
+    // Only the ordinary IM comes back; the at-most-once turn is dropped, not replayed.
+    expect(t.takeCarryOver()).toEqual([{ content: 'ordinary IM', turnId: 'im-1' }]);
+  });
+
   it('preserves a clean explicit-IM envelope but leaves a clean durable replay to the receiver', () => {
     const t = new InflightInputTracker();
     const codexAppInput = { text: 'clean' };

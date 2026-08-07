@@ -283,29 +283,63 @@ describe('reconcileIdempotencyLeasesOnBoot (crash convergence)', () => {
     expect(idempotencyStore.lookup(OWNER, 'k-adv')?.state).toBe('attempting');
   });
 
-  it('FINDING #2/#3: a reserved snapshot REPLACED by a different-identity winner → converge OUR orphan, leave the winner (no fake terminal, no throw)', async () => {
-    // The determinism codex reproduced: stale snapshot = sess-cc/reserved; disk was
-    // taken over to a DIFFERENT identity (sess-cc2/boot-OLD2). Reconcile must NOT
-    // fabricate a terminal on the winner (sess-cc2) nor throw — it converges our
-    // never-dispatched orphan (sess-cc) independently and leaves the winner to its
-    // own lease (which this sweep reaches on its own file, or skips if in-flight).
+  it('FINDING #2: different-identity winner = old-boot ATTEMPTING → classified ON THE SPOT (durable failed + quarantine both), not left for a non-existent re-scan', async () => {
+    // codex round-7 #2: the winner lives under the SAME key file (takeover
+    // overwrites in place) and `leases` is a one-time snapshot, so the winner is
+    // NEVER re-scanned. Reconcile must classify it on the spot. Winner here is an
+    // old-boot attempting fence with no live owner → durable dispatch_unknown +
+    // quarantine + close, so restore can't reattach a session with an unterminated
+    // lease. Our stale orphan (sess-cc) converges independently.
     const { record: reservedSnap } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-cc', triggerId: 'trg_cc', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-cc', now: 1 }) as any;
     const { file } = idempotencyStore.listAllForOwner(OWNER)[0];
-    // Disk advances to a DIFFERENT winner (takeover by another old boot).
-    idempotencyStore.takeover({ ownerLarkAppId: OWNER, key: 'k-cc', expect: reservedSnap, sessionId: 'sess-cc2', triggerId: 'trg_cc2', requestHash: 'h', ownerBootId: 'boot-OLD2', now: 6 });
-    sessionRows.set('sess-cc', { sessionId: 'sess-cc', status: 'open' });   // our orphan
-    sessionRows.set('sess-cc2', { sessionId: 'sess-cc2', status: 'open' }); // the winner
+    const { record: winner } = idempotencyStore.takeover({ ownerLarkAppId: OWNER, key: 'k-cc', expect: reservedSnap, sessionId: 'sess-cc2', triggerId: 'trg_cc2', requestHash: 'h', ownerBootId: 'boot-OLD2', now: 6 }) as any;
+    idempotencyStore.transition(OWNER, 'k-cc', winner, { state: 'attempting', now: 7 }); // winner crossed the barrier
+    sessionRows.set('sess-cc', { sessionId: 'sess-cc', status: 'open' });
+    sessionRows.set('sess-cc2', { sessionId: 'sess-cc2', status: 'open' });
     const listSpy = vi.spyOn(idempotencyStore, 'listAllForOwner').mockReturnValue([{ file, record: reservedSnap }]);
 
     const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
+    listSpy.mockRestore();
 
-    // OUR orphan converged (quarantined + closed); the winner NOT faked terminal.
+    // BOTH converged: our orphan (never dispatched) + the winner (durable failed).
     expect(quarantined.has('sess-cc')).toBe(true);
     expect(mockCloseSession).toHaveBeenCalledWith('sess-cc');
-    expect(asyncTriggerStore.lookup('sess-cc2', 'trg_cc2')).toBeUndefined(); // winner untouched
-    expect(mockCloseSession).not.toHaveBeenCalledWith('sess-cc2');
-    // The winner lease is intact on disk (left to its own lifecycle).
-    expect(idempotencyStore.lookup(OWNER, 'k-cc')?.sessionId).toBe('sess-cc2');
+    expect(quarantined.has('sess-cc2')).toBe(true);
+    expect(mockCloseSession).toHaveBeenCalledWith('sess-cc2');
+    const w = asyncTriggerStore.lookup('sess-cc2', 'trg_cc2');
+    expect(w?.result.status).toBe('failed');
+    expect(w?.result.reason).toBe('dispatch_unknown');
+  });
+
+  it('FINDING #2: different-identity winner = old-boot RESERVED with a LIVE session → fail-closed (cannot prove convergence)', async () => {
+    // An old-boot reserved winner that has a live session row could be a genuinely
+    // running turn; reconcile cannot prove it converged → throw (abort startup)
+    // rather than silently succeed and let it keep executing.
+    const { record: reservedSnap } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-cc', triggerId: 'trg_cc', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-cc', now: 1 }) as any;
+    const { file } = idempotencyStore.listAllForOwner(OWNER)[0];
+    idempotencyStore.takeover({ ownerLarkAppId: OWNER, key: 'k-cc', expect: reservedSnap, sessionId: 'sess-cc2', triggerId: 'trg_cc2', requestHash: 'h', ownerBootId: 'boot-OLD2', now: 6 });
+    sessionRows.set('sess-cc', { sessionId: 'sess-cc', status: 'open' });
+    sessionRows.set('sess-cc2', { sessionId: 'sess-cc2', status: 'open' }); // live winner session
+    const listSpy = vi.spyOn(idempotencyStore, 'listAllForOwner').mockReturnValue([{ file, record: reservedSnap }]);
+
+    await expect(reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession)).rejects.toThrow(/cannot prove convergence/);
+    listSpy.mockRestore();
+  });
+
+  it('FINDING #2: different-identity winner = old-boot RESERVED, NO live session → fenced remove + quarantine both', async () => {
+    const { record: reservedSnap } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-cc', triggerId: 'trg_cc', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-cc', now: 1 }) as any;
+    const { file } = idempotencyStore.listAllForOwner(OWNER)[0];
+    idempotencyStore.takeover({ ownerLarkAppId: OWNER, key: 'k-cc', expect: reservedSnap, sessionId: 'sess-cc2', triggerId: 'trg_cc2', requestHash: 'h', ownerBootId: 'boot-OLD2', now: 6 });
+    sessionRows.set('sess-cc', { sessionId: 'sess-cc', status: 'open' }); // only our orphan has a session row; winner has none
+    const listSpy = vi.spyOn(idempotencyStore, 'listAllForOwner').mockReturnValue([{ file, record: reservedSnap }]);
+
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
+    listSpy.mockRestore();
+
+    // Winner (never-dispatched reserved, no live session) → lease fenced-removed + quarantined.
+    expect(idempotencyStore.lookup(OWNER, 'k-cc')).toBeUndefined();
+    expect(quarantined.has('sess-cc')).toBe(true);
+    expect(quarantined.has('sess-cc2')).toBe(true);
   });
 
   it('FINDING #2: a corrupt OWN lease makes the whole reconcile throw (fail-closed, aborts startup)', async () => {

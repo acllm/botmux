@@ -29,6 +29,9 @@ export type InflightItem = {
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
+  /** At-most-once turn (idempotency lease): must NEVER be carried over to a
+   *  respawned CLI (codex #776 round-7 finding #1). See PendingCliInput.noReplay. */
+  noReplay?: boolean;
 };
 
 export class InflightInputTracker {

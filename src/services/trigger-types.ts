@@ -174,6 +174,17 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.kind must be turn or workflow' } };
   }
   const options = isRecord(raw.options) ? raw.options : {};
+  // Strict boolean typing for the mode/gate flags. The validator derives these
+  // with `=== true` but triggerSessionTurn consumes some with truthiness; a
+  // non-boolean (e.g. "false" / 1) would pass a scope gate here yet take a
+  // different runtime branch — which, for an idempotency turn, could skip the
+  // reserved→attempting barrier and break at-most-once. Reject non-booleans so
+  // the two layers can never diverge (codex #776 round-4).
+  for (const flag of ['waitForFinalOutput', 'asyncReturnSessionId', 'dryRun'] as const) {
+    if (options[flag] !== undefined && typeof options[flag] !== 'boolean') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: `options.${flag} must be a boolean` } };
+    }
+  }
   const waitForFinalOutput = options.waitForFinalOutput === true;
   const asyncReturnSessionId = options.asyncReturnSessionId === true;
   const hasChatId = typeof target.chatId === 'string' && target.chatId.trim().length > 0;

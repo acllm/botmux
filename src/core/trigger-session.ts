@@ -516,20 +516,23 @@ export async function triggerSessionTurn(
   // "session exists → reuse" map: a turn that crashed before/mid dispatch must
   // resolve to a terminal state, never silently re-run or hang `running`.
   const idempotencyKey = req.options?.idempotencyKey?.trim();
-  // requestHash binds the key to its business payload — a same-key retry with a
-  // different payload is a caller bug (409), not a silent join. Exclude the key
-  // itself and daemon-generated ids (session/chat); include what drives execution.
+  // requestHash binds the key to its full business payload — a same-key retry
+  // with a DIFFERENT payload is a caller bug (409), not a silent join. It must
+  // cover everything that renders into the prompt / drives execution:
+  // instruction, envelope, source, presentation, and the WHOLE options object
+  // EXCEPT the idempotencyKey itself (that's the lookup key, not payload). Hashing
+  // only a hand-picked subset (model/effort/suppress) silently reused a turn when
+  // e.g. options.status firing→resolved changed the prompt but not the hash
+  // (codex #776 round-4). No daemon-generated ids (session/chat/triggerId) are in
+  // these inputs, so the hash is stable across retries.
+  const { idempotencyKey: _omitKey, ...optionsForHash } = (req.options ?? {}) as Record<string, unknown>;
   const requestHash = idempotencyKey
     ? computeInputHash({
         instruction: req.instruction ?? null,
         envelope: req.envelope,
         source: req.source,
         presentation: req.presentation ?? null,
-        options: {
-          model: req.options?.model ?? null,
-          reasoningEffort: req.options?.reasoningEffort ?? null,
-          suppressFinalOutput: req.options?.suppressFinalOutput ?? null,
-        },
+        options: optionsForHash,
       })
     : '';
   const ownerBootId = getDaemonBootId();

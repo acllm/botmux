@@ -201,6 +201,25 @@ describe('trigger request contract', () => {
     expect(validateTriggerRequest(req).ok).toBe(true);
   });
 
+  it('rejects non-boolean mode/gate flags (prevents validator/runtime scope divergence)', () => {
+    // codex #776 round-4: a non-boolean waitForFinalOutput/asyncReturnSessionId/
+    // dryRun would pass the `=== true` scope gate yet flip a truthiness branch at
+    // runtime — for an idempotency turn that skips the reserved→attempting barrier
+    // and breaks at-most-once. Must 400.
+    for (const [flag, val] of [
+      ['waitForFinalOutput', 'false'], ['waitForFinalOutput', 1],
+      ['asyncReturnSessionId', 'true'], ['asyncReturnSessionId', 0],
+      ['dryRun', 'false'], ['dryRun', 'yes'],
+    ] as Array<[string, unknown]>) {
+      const req = request();
+      req.target = { kind: 'turn', botId: 'app1' };
+      (req.options as any) = { [flag]: val };
+      const v = validateTriggerRequest(req);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+    }
+  });
+
   it('builds a prompt that labels event data as untrusted', () => {
     const prompt = buildUntrustedEventPrompt(request(), 'trg_1');
     expect(prompt).toContain('untrusted event data');

@@ -230,9 +230,21 @@ export function transition(
   });
 }
 
+/** Delete a file, treating ONLY ENOENT as "already gone". EIO/EROFS/EACCES etc.
+ *  mean the file may still exist — the caller must NOT proceed as if released,
+ *  so we throw (finding: a swallowed unlink error left a reserved lease stuck to
+ *  a closed session). */
+function strictUnlink(fp: string): void {
+  try { unlinkSync(fp); }
+  catch (err: any) { if (err?.code !== 'ENOENT') throw err; }
+}
+
 /** Compare-and-remove: delete the lease ONLY if it still matches `expect`
  *  (identity + revision + state) under the lock. Used to release a `reserved`
- *  lease we created but abandoned before dispatch. Returns true if removed. */
+ *  lease we created but abandoned before dispatch. Returns true if removed,
+ *  false if the on-disk record changed (someone advanced it) or was already
+ *  gone. THROWS on an ambiguous unlink error (EIO/EROFS/…): the caller must be
+ *  able to trust that `true` means the lease is truly released. */
 export function compareAndRemove(ownerLarkAppId: string, key: string, expect: IdempotencyRecord): boolean {
   const fp = fileFor(ownerLarkAppId, key);
   return withKeyLock(fp, () => {
@@ -241,14 +253,17 @@ export function compareAndRemove(ownerLarkAppId: string, key: string, expect: Id
     if (current.revision !== expect.revision || current.state !== expect.state || !sameIdentity(current, expect)) {
       return false;
     }
-    try { unlinkSync(fp); } catch { /* already gone */ }
+    strictUnlink(fp); // throws on EIO/EROFS/… (never a silent success)
     return true;
   });
 }
 
-/** Enumerate every stored lease (boot reconcile). Best-effort per file: a
- *  corrupt file is logged + skipped so it can't abort the sweep. */
-export function listAll(): Array<{ file: string; record: IdempotencyRecord }> {
+/** Enumerate every stored lease (boot reconcile). By default a corrupt file is
+ *  logged + skipped. With `throwOnCorrupt`, a corrupt lease THROWS instead — the
+ *  reconcile can't prove such a lease converged, so it must fail-closed rather
+ *  than silently skip (a skipped corrupt lease could hide an unconverged
+ *  attempting fence). */
+export function listAll(opts: { throwOnCorrupt?: boolean } = {}): Array<{ file: string; record: IdempotencyRecord }> {
   const dir = getDir();
   if (!existsSync(dir)) return [];
   const out: Array<{ file: string; record: IdempotencyRecord }> = [];
@@ -259,16 +274,30 @@ export function listAll(): Array<{ file: string; record: IdempotencyRecord }> {
       const rec = readRecord(fp);
       if (rec) out.push({ file: fp, record: rec });
     } catch (err) {
+      if (opts.throwOnCorrupt) throw new Error(`unreadable idempotency lease ${fp}: ${(err as Error).message}`);
       logger.warn(`[idempotency] skipping unreadable lease ${fp}: ${err}`);
     }
   }
   return out;
 }
 
-/** Reconcile-only remove by path, under a lock keyed on that path. Used by boot
- *  reconcile to drop a pre-dispatch `reserved` lease. Best-effort. */
-export function removeByPathLocked(fp: string): void {
-  withKeyLock(fp, () => {
-    try { if (existsSync(fp)) unlinkSync(fp); } catch { /* ignore */ }
+/** Reconcile-only compare-and-remove BY PATH (reconcile enumerated the file via
+ *  listAll and holds a snapshot record; the plaintext key isn't recoverable from
+ *  the hashed filename). Re-reads under the lock and removes ONLY if the on-disk
+ *  record still matches the snapshot's full identity + revision + state — so a
+ *  stale reserved snapshot can NOT delete a fence that has since advanced to
+ *  `attempting` (finding: old sweep erasing a crossed commit-unknown barrier).
+ *  Returns true iff removed. THROWS on an ambiguous unlink error. */
+export function compareAndRemoveByPath(fp: string, expect: IdempotencyRecord): boolean {
+  return withKeyLock(fp, () => {
+    let current: IdempotencyRecord | undefined;
+    try { current = readRecord(fp); }
+    catch { return false; } // corrupt now → leave it for a human, never blind-delete
+    if (!current) return false;
+    if (current.revision !== expect.revision || current.state !== expect.state || !sameIdentity(current, expect)) {
+      return false; // advanced/changed under us — keep it
+    }
+    strictUnlink(fp);
+    return true;
   });
 }

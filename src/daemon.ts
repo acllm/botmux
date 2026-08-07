@@ -18971,18 +18971,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // interleave with the sweep and have its fresh lease mistaken for stale) and is
   // scoped to THIS bot (the dataDir is shared across bots). Converges leases left
   // by a previous boot: `attempting` → durable failed(dispatch_unknown) + close;
-  // `reserved` → drop + close. Returns the sessionIds it terminalized/closed so
-  // restoreActiveSessions can quarantine them from re-attach (else a session the
+  // `reserved` → CAS-remove + close. Returns the sessionIds it terminalized/closed
+  // so restoreActiveSessions can quarantine them from re-attach (else a session the
   // poller now sees `failed` could be reattached and keep running — state/exec
   // divergence). sessionStore is init'd + worker pool is up by here.
-  let idempotencyQuarantinedSessionIds = new Set<string>();
+  //
+  // FAIL-CLOSED: if reconcile throws (a lease it could not prove converged — a
+  // strict-failed write that failed, a corrupt lease, an unlink/close that
+  // errored), we must NOT bind the IPC server and restore sessions as if
+  // everything converged — that is exactly the "poller hangs running / orphan
+  // re-attach" this feature exists to prevent. Abort this bot's startup so an
+  // operator/supervisor sees it, rather than fail-open into an inconsistent state.
+  let idempotencyQuarantinedSessionIds: Set<string>;
   try {
     idempotencyQuarantinedSessionIds = await reconcileIdempotencyLeasesOnBoot(cfg.larkAppId, getDaemonBootId());
   } catch (err) {
-    // A failed reconcile means an ambiguous turn might still poll `running` — do
-    // not proceed as if converged; surface loudly. (recordFailedStrict throwing
-    // is the main way this happens.)
-    logger.error(`[idempotency] boot reconcile failed — some leases may be unconverged: ${err instanceof Error ? err.message : err}`);
+    logger.error(`[idempotency] boot reconcile failed to converge — aborting bot startup (fail-closed): ${err instanceof Error ? err.message : err}`);
+    throw err instanceof Error ? err : new Error(String(err));
   }
   // Seed dashboard IPC botName with the custom displayName (falling back to the
   // bot's config id); the friendly name from /bot/v3/info is wired into the

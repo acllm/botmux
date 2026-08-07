@@ -11,7 +11,7 @@
  * Run:  pnpm vitest run test/trigger-session-idempotency-e2e.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { TriggerRequest } from '../src/services/trigger-types.js';
@@ -155,5 +155,19 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     const retry = await triggerSessionTurn(freshAsyncReq('k-4'), { larkAppId: APP, activeSessions: new Map() });
     expect(retry.state).toBe('failed');
     expect(mockForkWorker.mock.calls.length).toBe(forkBefore); // no new fork
+  });
+
+  it('DOUBLE failure (fork throw + terminal write throw) → 5xx trigger_failed, NOT a phantom state:failed', async () => {
+    forkShouldThrow = true;
+    // Make recordFailedStrict's durable write fail: pre-create the async-triggers
+    // target path for the next session (sess-1) as a DIRECTORY, so the atomic
+    // rename onto it fails. The dispatch throws AND the terminal write throws →
+    // we must NOT claim state:failed (the caller could never observe it).
+    const asyncDir = join(tempDir, 'async-triggers');
+    mkdirSync(join(asyncDir, 'sess-1.json'), { recursive: true }); // path is a dir → write fails
+    const res = await triggerSessionTurn(freshAsyncReq('k-dbl'), { larkAppId: APP, activeSessions: new Map() });
+    expect(res.ok).toBe(false);
+    expect(res.state).not.toBe('failed');       // no phantom terminal
+    expect(res.errorCode).toBe('trigger_failed'); // honest 5xx-class hard error
   });
 });

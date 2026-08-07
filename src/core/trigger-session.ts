@@ -233,33 +233,55 @@ export async function reconcileIdempotencyLeasesOnBoot(
 ): Promise<Set<string>> {
   const now = Date.now();
   const quarantined = new Set<string>();
-  for (const { file, record } of idempotencyStore.listAll()) {
+  // Fail-closed: any lease we cannot PROVE converged (terminal not durable, or a
+  // corrupt/unreadable lease we can't reason about) makes the whole reconcile
+  // throw — the daemon must then abort this bot's startup rather than bind and
+  // let a poller hang `running` or an orphan re-attach. We finish the sweep to
+  // converge everything we can, but remember the first hard failure and rethrow.
+  let hardFailure: Error | undefined;
+  const leases = idempotencyStore.listAll({ throwOnCorrupt: true }); // corrupt → throw (unprovable)
+  for (const { file, record } of leases) {
+    // Owner scoping (fail-closed) + skip current boot's own in-flight leases.
+    if (record.ownerLarkAppId !== ownerLarkAppId) continue;
+    if (record.ownerBootId === currentBootId) continue;
     try {
-      // Owner scoping (fail-closed) + skip current boot's own in-flight leases.
-      if (record.ownerLarkAppId !== ownerLarkAppId) continue;
-      if (record.ownerBootId === currentBootId) continue;
       const outcome = asyncTriggerStore.lookup(record.sessionId, record.triggerId)?.result.status;
-      if (outcome === 'completed' || outcome === 'failed') continue; // already converged
-      if (record.state === 'attempting') {
-        // Authoritative terminal FIRST (throws on failure → surfaced to caller,
-        // which fails boot readiness rather than silently leaving `running`).
-        asyncTriggerStore.recordFailedStrict(record.sessionId, record.triggerId, now, ownerLarkAppId, 'dispatch_unknown');
+      if (outcome === 'completed') continue; // converged good; retry reuses + polls
+      if (outcome === 'failed') {
+        // Already durable-failed, but a PREVIOUS boot may have crashed after
+        // writing failed and before closing → always re-quarantine and re-attempt
+        // close, so restore never re-attaches a session the caller already saw failed.
         quarantined.add(record.sessionId);
-        if (getSession(record.sessionId)) {
-          try { await closeSession(record.sessionId); } catch (e) { logger.warn(`[idempotency] reconcile close ${record.sessionId} failed (terminal already durable): ${(e as Error).message}`); }
-        }
+        if (getSession(record.sessionId)) await closeSession(record.sessionId);
         continue;
       }
-      // reserved: provably never dispatched → drop the lease (by enumerated path,
-      // under its own lock) + close the empty session.
-      idempotencyStore.removeByPathLocked(file);
-      quarantined.add(record.sessionId);
-      if (getSession(record.sessionId)) {
-        try { await closeSession(record.sessionId); } catch (e) { logger.warn(`[idempotency] reconcile close ${record.sessionId} failed: ${(e as Error).message}`); }
+      if (record.state === 'attempting') {
+        // Write the authoritative terminal FIRST (throws on I/O failure), THEN
+        // quarantine + close. Quarantine happens regardless of close success.
+        asyncTriggerStore.recordFailedStrict(record.sessionId, record.triggerId, now, ownerLarkAppId, 'dispatch_unknown');
+        quarantined.add(record.sessionId);
+        if (getSession(record.sessionId)) await closeSession(record.sessionId);
+        continue;
       }
+      // reserved: provably never dispatched → CAS-remove by path (only if the
+      // on-disk record is still this exact reserved snapshot — never delete a
+      // fence that advanced to attempting), + close the empty session.
+      idempotencyStore.compareAndRemoveByPath(file, record);
+      quarantined.add(record.sessionId);
+      if (getSession(record.sessionId)) await closeSession(record.sessionId);
     } catch (err) {
-      logger.warn(`[idempotency] boot reconcile skipped a lease: ${(err as Error).message}`);
+      // This lease could not be converged (strict-failed write threw, CAS-remove
+      // threw on EIO, or close threw). Do NOT skip-and-continue as "handled":
+      // record it and keep the session quarantined so restore can't revive it,
+      // then fail the whole reconcile after the sweep.
+      quarantined.add(record.sessionId);
+      const e = err as Error;
+      logger.error(`[idempotency] reconcile could not converge lease for ${record.sessionId}: ${e.message}`);
+      if (!hardFailure) hardFailure = e;
     }
+  }
+  if (hardFailure) {
+    throw new Error(`idempotency boot reconcile failed to converge at least one lease: ${hardFailure.message}`);
   }
   return quarantined;
 }
@@ -1027,11 +1049,33 @@ export async function triggerSessionTurn(
         ? triggerId
         : { turnId: triggerId, dispatchAttempt });
     } catch (err) {
+      // The ONLY thing that lets us honestly report a terminal `failed` is a
+      // DURABLE failed record (that is what trigger-result reads). If the strict
+      // write itself fails (disk full/EIO), we must NOT claim `state:failed` —
+      // the caller could never observe it and would see `running` forever. In
+      // that double-failure case return a 5xx so the caller treats it as an
+      // unknown hard error (and the next boot's reconcile will converge the
+      // still-`attempting` lease). Only on a successful durable write do we
+      // return the terminal failed. (finding: double storage failure must be a
+      // fail-closed 5xx, not a phantom `failed`.)
+      let terminalDurable = false;
       if (idempotencyKey) {
-        try { asyncTriggerStore.recordFailedStrict(session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown'); }
-        catch (e) { logger.error(`[idempotency] failed to record dispatch_unknown after dispatch throw: ${(e as Error).message}`); }
+        try {
+          asyncTriggerStore.recordFailedStrict(session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
+          terminalDurable = true;
+        } catch (e) {
+          logger.error(`[idempotency] dispatch threw AND recordFailedStrict failed — lease stays attempting for next-boot reconcile: ${(e as Error).message}`);
+        }
       }
-      try { await closeSession(session.sessionId); } catch { /* best-effort */ }
+      try { await closeSession(session.sessionId); } catch { /* best-effort; terminal already durable if terminalDurable */ }
+      if (idempotencyKey && !terminalDurable) {
+        return {
+          ok: false, errorCode: 'trigger_failed',
+          error: `dispatch failed and terminal outcome could not be persisted: ${(err as Error).message}`,
+          target: { kind: 'turn', sessionId: session.sessionId, chatId },
+          idempotencyKey,
+        };
+      }
       return {
         ok: false, state: 'failed', triggerId,
         errorCode: 'no_output', error: `dispatch failed with unknown outcome: ${(err as Error).message}`,

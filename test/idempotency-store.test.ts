@@ -23,7 +23,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
-  claim, transition, takeover, lookup, compareAndRemove, listAll, removeByPathLocked,
+  claim, transition, takeover, lookup, compareAndRemove, listAll, compareAndRemoveByPath,
   IdempotencyConflictError,
   type IdempotencyRecord,
 } from '../src/services/idempotency-store.js';
@@ -154,12 +154,17 @@ describe('reconcile enumeration', () => {
     expect(all.every(a => a.file.endsWith('.json'))).toBe(true);
   });
 
-  it('removeByPathLocked drops a lease by its enumerated path', () => {
+  it('compareAndRemoveByPath drops a lease only if the on-disk record still matches the snapshot', () => {
     claim(base());
-    const { file } = listAll()[0];
-    removeByPathLocked(file);
+    const { file, record } = listAll()[0];
+    // Stale snapshot (advanced to attempting under us) → must NOT delete the fence.
+    transition('cli_a', 'k1', record, { state: 'attempting', now: 5000 }); // rev2 attempting
+    expect(compareAndRemoveByPath(file, record)).toBe(false); // record is the rev1 reserved snapshot
+    expect(lookup('cli_a', 'k1')?.state).toBe('attempting'); // fence preserved (codex repro)
+    // Exact match → removed.
+    const current = lookup('cli_a', 'k1')!;
+    expect(compareAndRemoveByPath(file, current)).toBe(true);
     expect(lookup('cli_a', 'k1')).toBeUndefined();
-    expect(() => removeByPathLocked(file)).not.toThrow(); // idempotent
   });
 
   it('listAll skips (does not throw on) a corrupt file', () => {

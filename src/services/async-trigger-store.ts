@@ -85,6 +85,26 @@ function load(sessionId: string): AsyncTriggerFile {
   }
 }
 
+/** STRICT loader for the authoritative failed-evidence RMW: ONLY a genuinely
+ *  absent file (ENOENT) is treated as empty. A present-but-unreadable file
+ *  (EIO/EACCES), corrupt JSON, or invalid shape THROWS — the soft `load()` would
+ *  fold these into `{results:{}}`, and recordFailedStrict would then durably
+ *  OVERWRITE a file that might hold a `completed` proof or another owner's data
+ *  (finding: strict write over a soft read defeats completed-wins/owner-proof). */
+function loadStrict(sessionId: string): AsyncTriggerFile {
+  const fp = getFilePath(sessionId);
+  try { readFileSync(fp, 'utf-8'); }
+  catch (err: any) {
+    if (err?.code === 'ENOENT') return { results: {} };
+    throw err; // EIO/EACCES/… — do NOT treat as empty
+  }
+  const data = JSON.parse(readFileSync(fp, 'utf-8')) as AsyncTriggerFile; // corrupt → throw
+  if (!data || typeof data !== 'object' || typeof data.results !== 'object') {
+    throw new Error(`corrupt async-trigger file (invalid shape): ${fp}`);
+  }
+  return { ownerLarkAppId: data.ownerLarkAppId, latestTriggerId: data.latestTriggerId, results: data.results ?? {} };
+}
+
 function save(sessionId: string, file: AsyncTriggerFile): void {
   ensureDir();
   const fp = getFilePath(sessionId);
@@ -178,7 +198,12 @@ export function recordFailedStrict(
   if (!ownerLarkAppId) throw new Error('recordFailedStrict requires ownerLarkAppId');
   ensureDir();
   withFileLockSync(getFilePath(sessionId), () => {
-    const file = load(sessionId);
+    const file = loadStrict(sessionId); // ONLY ENOENT is empty; corrupt/EIO throws
+    // Owner proof: never overwrite another bot's file (a hash/path mixup or a
+    // cross-bot mistake must fail-closed, not clobber their evidence).
+    if (file.ownerLarkAppId && file.ownerLarkAppId !== ownerLarkAppId) {
+      throw new Error(`recordFailedStrict owner mismatch: file owned by ${file.ownerLarkAppId}, caller ${ownerLarkAppId}`);
+    }
     const prev = file.results[triggerId];
     if (prev?.status === 'completed') return; // completed is stronger — keep it
     file.ownerLarkAppId = ownerLarkAppId;

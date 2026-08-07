@@ -83,7 +83,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getDaemonBootId: () => 'boot-CURRENT',
 }));
 
-import { triggerSessionTurn } from '../src/core/trigger-session.js';
+import { triggerSessionTurn, convergeIdempotentAsyncTurnOnWorkerExit, buildExternalEventDataContext } from '../src/core/trigger-session.js';
 import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as idempotencyStore from '../src/services/idempotency-store.js';
 
@@ -259,5 +259,71 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(retry.state).toBe('failed');
     expect(retry.idempotent).toBe(true);
     expect(mockForkWorker).not.toHaveBeenCalled(); // no dispatch on the orphan
+  });
+
+  // ── codex #776 round-6 finding #1: worker exits with NO final_output. The
+  //    dispatched turn stamps ds.idempotentAsyncTurn; the worker-exit handler
+  //    must converge it to a durable dispatch_unknown so a same-key retry AND
+  //    trigger-result both resolve `failed`, never re-forking / polling forever.
+  it('worker exit with no final_output → durable dispatch_unknown; retry + poll both failed, no 2nd fork', async () => {
+    const shared = new Map();
+    const first = await triggerSessionTurn(freshAsyncReq('k-wx'), { larkAppId: APP, activeSessions: shared });
+    expect(first.ok).toBe(true);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    const sid = first.target!.sessionId!;
+    // Locate the dispatched DaemonSession + its stamped generation.
+    const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
+    expect(ds?.idempotentAsyncTurn?.triggerId).toBe(first.triggerId);
+    const gen = ds.idempotentAsyncTurn.workerGeneration;
+    // Simulate the real worker-exit handler: worker=null (dead), then converge.
+    ds.worker = null;
+    convergeIdempotentAsyncTurnOnWorkerExit(ds, gen);
+    // Durable authoritative terminal is written…
+    expect(asyncTriggerStore.lookup(sid, first.triggerId!)?.result.status).toBe('failed');
+    expect(asyncTriggerStore.lookup(sid, first.triggerId!)?.result.reason).toBe('dispatch_unknown');
+    // …the stamp is cleared (idempotent: a later gen exit is a no-op)…
+    expect(ds.idempotentAsyncTurn).toBeUndefined();
+    // …and a same-key retry resolves TERMINAL without a second fork.
+    const retry = await triggerSessionTurn(freshAsyncReq('k-wx'), { larkAppId: APP, activeSessions: shared });
+    expect(retry.state).toBe('failed');
+    expect(retry.idempotent).toBe(true);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1); // still ONE fork
+  });
+
+  it('worker-exit convergence ignores a NON-matching generation (no retro-fail of a later turn)', async () => {
+    const shared = new Map();
+    const first = await triggerSessionTurn(freshAsyncReq('k-wxgen'), { larkAppId: APP, activeSessions: shared });
+    const sid = first.target!.sessionId!;
+    const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
+    const gen = ds.idempotentAsyncTurn.workerGeneration;
+    // A DIFFERENT (older) generation exits → must NOT converge this turn.
+    convergeIdempotentAsyncTurnOnWorkerExit(ds, gen - 1);
+    expect(asyncTriggerStore.lookup(sid, first.triggerId!)?.result.status).toBe('pending'); // untouched
+    expect(ds.idempotentAsyncTurn).toBeDefined(); // stamp intact
+  });
+
+  // ── codex #776 round-6 finding #4: the raw idempotencyKey must NOT leak into
+  //    the rendered prompt, or trim-equivalent keys ('k' vs ' k ') would produce
+  //    a different prompt while the hash (which excludes the key) matches — a
+  //    silent reuse flagged as `prompt differs`. The renderer strips the key too.
+  it('idempotencyKey is stripped from the rendered event prompt (normalized-key seam)', () => {
+    const withKey = { ...freshAsyncReq('  spaced-key  '), options: { asyncReturnSessionId: true, idempotencyKey: '  spaced-key  ', status: 'firing' } } as any;
+    const prompt = buildExternalEventDataContext(withKey, 'trg_x');
+    expect(prompt).not.toContain('spaced-key');   // raw key never rendered
+    expect(prompt).not.toContain('idempotencyKey'); // field itself stripped
+    expect(prompt).toContain('"status": "firing"'); // other options still rendered
+  });
+
+  it('trim-equivalent keys reuse the SAME lease and do NOT 409 (prompt is identical after strip)', async () => {
+    const a = await triggerSessionTurn({ ...freshAsyncReq('k-trim'), options: { asyncReturnSessionId: true, idempotencyKey: 'k-trim' } } as any, { larkAppId: APP, activeSessions: new Map() });
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    // A retry with a whitespace-padded key trims to the same lookup key; because
+    // the renderer strips the key, optionsForHash AND the rendered prompt are
+    // identical → legitimate reuse, NOT a 409 idempotency_conflict.
+    const b = await triggerSessionTurn({ ...freshAsyncReq('k-trim'), options: { asyncReturnSessionId: true, idempotencyKey: '  k-trim  ' } } as any, { larkAppId: APP, activeSessions: new Map() });
+    expect(b.errorCode).not.toBe('idempotency_conflict');
+    expect(b.idempotent).toBe(true);
+    expect(b.target?.sessionId).toBe(a.target?.sessionId);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1); // no second fork
   });
 });

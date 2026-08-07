@@ -248,6 +248,23 @@ export interface DaemonSession {
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
+  /** Set on a fresh async virtual turn dispatched under an at-most-once
+   *  idempotency lease (options.idempotencyKey). Lets the worker-exit handler
+   *  converge an INCOMPLETE idempotent async turn to a durable
+   *  `dispatch_unknown` terminal: a worker that dies with no final_output leaves
+   *  ds.worker=null but keeps the session in activeSessions + the async record
+   *  `pending`, which would otherwise poll `running` forever and let a same-key
+   *  retry reuse the dead session until the next daemon reconcile (codex #776
+   *  round-6 finding #1). Cleared once the turn completes (final_output). */
+  idempotentAsyncTurn?: {
+    ownerLarkAppId: string;
+    key: string;
+    triggerId: string;
+    /** The worker generation this turn was dispatched on. The exit handler only
+     *  converges when the DYING generation is this one (a later generation that
+     *  completed and moved on must not be retro-failed). */
+    workerGeneration: number;
+  };
   /** Stable turn ids whose automatic transcript fallback is capture/discard.
    *  turn_terminal clears the entry; bounded in trigger-session for crash
    *  paths that never produce a terminal. */

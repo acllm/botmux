@@ -115,11 +115,20 @@ export function buildExternalEventDataContext(req: TriggerRequest, triggerId: st
   // 其他 connector 保持原有 pretty-print 行为不变。
   const compact = req.source.type === 'vc_meeting';
   const { rawText, ...envelopeRest } = req.envelope;
+  // idempotencyKey is transport metadata (dispatch lease lookup), deliberately
+  // NOT part of the business payload — the requestHash excludes it. It must be
+  // stripped from the RENDERED options too, or the raw pre-trim key leaks into
+  // the model prompt: `'k'` vs `' k '` trim to the same lease + identical
+  // hash-options yet would render different prompt JSON, so the second retry
+  // reuses silently while `prompt differs` — the exact seam codex #776 round-6
+  // finding #4 flagged. Stripping it keeps renderer and hash on the SAME
+  // normalized execution payload, so trim-equivalent keys are a legitimate reuse.
+  const { idempotencyKey: _omitRenderedKey, ...optionsForRender } = (req.options ?? {}) as Record<string, unknown>;
   const body = {
     triggerId,
     source: req.source,
     envelope: compact ? envelopeRest : req.envelope,
-    options: req.options ?? {},
+    options: optionsForRender,
   };
   const lines: string[] = [];
   lines.push(
@@ -184,6 +193,15 @@ export function resolveIdempotencyHit(
   activeSessions: Map<string, DaemonSession>,
 ): IdempotencyHitDecision {
   const live = activeBySessionId(activeSessions, hit.sessionId);
+  // "In flight" for reuse decisions means a genuinely EXECUTING worker, not mere
+  // registry presence. A worker that died with no final_output sets ds.worker=null
+  // but leaves the DaemonSession in activeSessions (worker-pool.ts exit handler),
+  // so `!!live` alone would wrongly report reuse/queued forever (codex #776
+  // round-6 finding #1). Require a non-killed worker. (The worker-exit handler
+  // also writes a durable dispatch_unknown that makes the owned-failed branch
+  // below fire first; this guard closes the race window before that write and any
+  // path where the stamp was absent.)
+  const liveWorker = !!live?.worker && !live.worker.killed;
   // Owner-scoped session read: getOwnedSession returns a row ONLY from this
   // process's own bot store, never another bot's sessions-*.json (getSession's
   // cross-file fallback could surface a foreign session and leak its chatId —
@@ -215,30 +233,30 @@ export function resolveIdempotencyHit(
     return { kind: 'terminal', chatId, message: 'previous dispatch outcome is unknown (ambiguous crash); not re-run (at-most-once)' };
   }
   if (hit.state === 'attempting') {
-    // Ground truth for "genuinely in flight" is a LIVE worker, NOT ownerBootId.
-    // A dispatched turn stays registered in activeSessions from creation (before
-    // the barrier) until closeSession, so a real in-flight turn is always live —
-    // regardless of which boot claimed it. Conversely a same-boot `attempting`
-    // lease with NO live worker is an ORPHAN: the barrier-fail release couldn't
-    // delete a crossed fence (EIO / post-rename fsync throw), or the session was
-    // closed without durable terminal evidence. Reusing it would poll a closed
-    // session forever until the next boot's reconcile (codex #776 finding #1
-    // reuse-forever). Treat any not-live attempting as terminal (at-most-once:
-    // never re-dispatch); reconcile / the poll-side resolver make it durable.
-    if (live) {
+    // Ground truth for "genuinely in flight" is a LIVE WORKER, not registry
+    // presence or ownerBootId. A dispatched turn holds a non-killed worker from
+    // fork (synchronous, no await between register and fork) until the worker
+    // exits. A worker that died with no final_output leaves ds in the map with
+    // worker=null — an ORPHAN, not in flight. The worker-exit handler writes a
+    // durable dispatch_unknown (caught by the owned-failed branch above); this
+    // liveWorker guard closes the race window before that write and any path
+    // where no stamp existed. Not-live attempting → terminal (at-most-once:
+    // never re-dispatch); reconcile / worker-exit make it durable (codex #776
+    // round-6 finding #1: registry presence ≠ execution liveness).
+    if (liveWorker) {
       return { kind: 'reuse', chatId, message: 'idempotency key in flight; reuse the session (poll trigger-result)' };
     }
     return { kind: 'terminal', chatId, message: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)' };
   }
   // reserved
   if (hit.ownerBootId === ownerBootId) {
-    // Same-boot reserved: mid-dispatch in THIS process (between claim and barrier)
-    // only if the session is still live. A not-live same-boot reserved lease is an
-    // abandoned pre-dispatch orphan (barrier-fail release hit EIO and couldn't
-    // prove removal) — fail-closed to terminal so a retry never reuses the closed
-    // session forever (codex #776 finding #1 case 1a). The still-reserved lease is
-    // swept by the next boot's reconcile; retries stay terminal until then.
-    if (live) {
+    // Same-boot reserved: mid-dispatch in THIS process (between claim and the
+    // attempting barrier) only while a live worker is executing it. A not-live
+    // same-boot reserved lease is an abandoned pre-dispatch orphan (barrier-fail
+    // release hit EIO and couldn't prove removal) — fail-closed to terminal so a
+    // retry never reuses the closed session forever (codex #776 round-6 finding
+    // #1). The still-reserved lease is swept by the next boot's reconcile.
+    if (liveWorker) {
       return { kind: 'reuse', chatId, message: 'idempotency key reserved and being dispatched; reuse the session' };
     }
     return { kind: 'terminal', chatId, message: 'previous reservation was abandoned pre-dispatch with unknown outcome; not re-run (at-most-once)' };
@@ -333,27 +351,50 @@ export async function reconcileIdempotencyLeasesOnBoot(
       }
       // reserved: provably never dispatched → CAS-remove by path (only if the
       // on-disk record is still this exact reserved snapshot). A discriminated
-      // result (not a swallowed boolean) so we react to a lease that ADVANCED
-      // under us instead of declaring the sweep converged (finding #2):
+      // result (not a swallowed boolean) so we react to a lease that CHANGED
+      // under us instead of declaring the sweep converged (findings #2/#3):
       //  - removed / absent → converged; quarantine + close the empty session.
-      //  - changed → the lease moved between our snapshot and the CAS re-read.
-      //    Reclassify by its CURRENT state: an `attempting` now is a crossed
-      //    commit-unknown barrier → terminalize (never delete). A current-boot
-      //    re-claim → leave it (in-flight). Anything else (still reserved but a
-      //    different revision/older-boot, i.e. a concurrent takeover) is not
-      //    provably converged → fail-closed.
+      //  - changed + sameIdentity + now `attempting` → MY exact lease advanced
+      //    (a crossed commit-unknown barrier by a concurrent flow of the same
+      //    identity): terminalize by the CURRENT record's own session/trigger and
+      //    quarantine/close THAT session (cur.sessionId) — never the stale
+      //    snapshot's — else a session already declared `failed` could be
+      //    re-attached (finding #2). The stale snapshot has the same sessionId
+      //    here (identity matched), so one convergence covers it.
+      //  - changed + DIFFERENT identity → a takeover/re-claim replaced the slot
+      //    with a NEW session/trigger/boot. That winner is not ours to
+      //    terminalize; we must (a) leave the winner to its own lifecycle (skip
+      //    it if it's the current boot / genuinely in flight; otherwise it is a
+      //    previous-boot lease that this same sweep will reach on its own file),
+      //    and (b) independently converge OUR stale-snapshot orphan session
+      //    (record.sessionId), which was never dispatched. Faking a local
+      //    terminal on the winner would fork state/execution from the caller's
+      //    view (finding #3).
       //    (corrupt / EIO inside the CAS THROWS — caught below → fail-closed.)
       const rm = idempotencyStore.compareAndRemoveByPath(file, record);
       if (rm.kind === 'changed') {
         const cur = rm.current;
-        if (cur.ownerBootId === currentBootId) continue; // re-claimed by us → in-flight, untouched
-        if (cur.state === 'attempting') {
-          terminalizeAttempting(cur);
-          quarantined.add(record.sessionId);
-          if (getSession(record.sessionId)) await closeSession(record.sessionId);
-          continue;
+        if (rm.sameIdentity) {
+          // Same immutable identity, only state/revision advanced. current-boot
+          // re-claim → genuinely in flight, leave it. Otherwise a previous-boot
+          // crossed fence → terminalize + quarantine/close by the CURRENT record.
+          if (cur.ownerBootId === currentBootId) continue;
+          if (cur.state === 'attempting') {
+            terminalizeAttempting(cur);
+            quarantined.add(cur.sessionId);
+            if (getSession(cur.sessionId)) await closeSession(cur.sessionId);
+            continue;
+          }
+          throw new Error(`reserved lease advanced to an unexpected state under reconcile CAS (rev ${cur.revision} state ${cur.state} boot ${cur.ownerBootId}); cannot prove convergence`);
         }
-        throw new Error(`reserved lease changed under reconcile CAS (now rev ${cur.revision} state ${cur.state} boot ${cur.ownerBootId}); cannot prove convergence`);
+        // DIFFERENT identity replaced the slot (takeover/re-claim). Do NOT
+        // terminalize the winner. Converge OUR never-dispatched stale-snapshot
+        // orphan session independently; the winner is handled by its own lease
+        // (its own file if previous-boot, or skipped as in-flight if current-boot).
+        logger.warn(`[idempotency] reconcile: reserved snapshot for ${record.sessionId} was replaced by a different winner (session=${cur.sessionId} boot=${cur.ownerBootId} state=${cur.state}); converging our orphan, leaving the winner`);
+        quarantined.add(record.sessionId);
+        if (getSession(record.sessionId)) await closeSession(record.sessionId);
+        continue;
       }
       quarantined.add(record.sessionId);
       if (getSession(record.sessionId)) await closeSession(record.sessionId);
@@ -373,6 +414,59 @@ export async function reconcileIdempotencyLeasesOnBoot(
     throw new Error(`idempotency boot reconcile failed to converge at least one lease: ${hardFailure.message}`);
   }
   return quarantined;
+}
+
+/**
+ * Converge an INCOMPLETE idempotent async turn when its worker exits (codex #776
+ * round-6 finding #1). A worker that dies with no final_output sets ds.worker=null
+ * but leaves the session in activeSessions and its async record `pending`, so
+ * trigger-result would poll `running` and a same-key retry would `reuse` the dead
+ * session — both forever, until the next daemon boot reconcile. Registry presence
+ * is NOT execution liveness.
+ *
+ * We write the authoritative durable `dispatch_unknown` failed (the same terminal
+ * the boot reconcile writes), which trigger-result reads BEFORE its running
+ * branch and resolveIdempotencyHit reads as `terminal` — converging both without
+ * a re-dispatch. Best-effort + fail-safe: only fires for the EXACT generation
+ * that was stamped (a later generation that already completed/moved on is
+ * ignored), and only when no completed evidence exists (completed always wins in
+ * recordFailedStrict anyway). Idempotent: the stamp is cleared after.
+ *
+ * Called from the daemon's onWorkerExit callback. Not async-critical: a throw is
+ * logged, not propagated (the exit handler must not crash the daemon), but the
+ * durable write uses the strict/owner-proofed path so a genuine I/O failure is
+ * surfaced in logs and the still-attempting lease is left for the next boot's
+ * reconcile — exactly the same fail-open-to-reconcile fallback as the barrier.
+ */
+export function convergeIdempotentAsyncTurnOnWorkerExit(
+  ds: DaemonSession,
+  exitingWorkerGeneration: number,
+): void {
+  const turn = ds.idempotentAsyncTurn;
+  if (!turn) return;
+  // Only converge the generation this turn was dispatched on. A later worker
+  // generation (post-completion re-fork, takeover) exiting must not retro-fail a
+  // turn that already produced output on an earlier generation.
+  if (turn.workerGeneration !== exitingWorkerGeneration) return;
+  // Already completed (final_output cleared the stamp, or a durable completed
+  // exists)? recordFailedStrict is completed-wins, but skip the write entirely
+  // when we can already see completion to avoid a pointless lock + log.
+  const existing = asyncTriggerStore.lookup(ds.session.sessionId, turn.triggerId);
+  if (existing?.result.status === 'completed') { ds.idempotentAsyncTurn = undefined; return; }
+  try {
+    asyncTriggerStore.recordFailedStrict(ds.session.sessionId, turn.triggerId, Date.now(), turn.ownerLarkAppId, 'dispatch_unknown');
+    logger.warn(`[idempotency] worker exit converged incomplete idempotent async turn ${ds.session.sessionId}/${turn.triggerId} (gen ${exitingWorkerGeneration}) → durable dispatch_unknown`);
+    // The turn is now durably terminal; clear the stamp so a subsequent exit of a
+    // replacement generation is a no-op.
+    ds.idempotentAsyncTurn = undefined;
+  } catch (err) {
+    // Durable write failed (EIO / owner mismatch). Do NOT clear the stamp and do
+    // NOT throw into the exit handler: the attempting lease survives, so the next
+    // boot's reconcile converges it, and resolveIdempotencyHit's not-live guard
+    // stops a reuse-forever in the meantime (worker is dead → ds not live once the
+    // session closes). Same fail-open-to-reconcile fallback as the barrier.
+    logger.error(`[idempotency] worker-exit convergence write failed for ${ds.session.sessionId}/${turn.triggerId}; left for reconcile: ${(err as Error).message}`);
+  }
 }
 
 function waitForSessionFinalOutput(
@@ -1136,16 +1230,24 @@ export async function triggerSessionTurn(
           // idempotencyLease is still the pre-transition `reserved` snapshot
           // (markAttemptingBeforeDispatch only reassigns it on success).
           const rm = idempotencyStore.compareAndRemove(larkAppId, idempotencyKey, idempotencyLease);
-          if (rm.kind === 'changed' && rm.current.state === 'attempting') {
-            // The rename landed but a post-rename fsync threw: the disk is now a
-            // CROSSED commit-unknown fence. Never delete it — durably terminalize
-            // so a retry resolves `failed` (at-most-once), not reuse-forever.
+          if (rm.kind === 'changed' && rm.sameIdentity && rm.current.state === 'attempting') {
+            // MY exact lease (same immutable identity) advanced to attempting: the
+            // rename landed but a post-rename fsync threw → the disk is now a
+            // CROSSED commit-unknown fence I own. Never delete it — durably
+            // terminalize MY session/trigger so a retry resolves `failed`
+            // (at-most-once), not reuse-forever.
             asyncTriggerStore.recordFailedStrict(session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
             terminalizedCrossedFence = true;
           } else if (rm.kind === 'changed') {
-            // Changed to something other than attempting (a concurrent takeover /
-            // CAS by another flow): not ours to converge — leave it.
-            logger.warn(`[idempotency] barrier-fail release saw the lease change (rev ${rm.current.revision} state ${rm.current.state}); leaving it for reconcile`);
+            // Changed but NOT my identity advanced-to-attempting: either a
+            // DIFFERENT winner replaced the slot (takeover/re-claim), or my lease
+            // moved to an unexpected state. Do NOT fabricate a local terminal on a
+            // session that isn't the current winner (finding #3) — that would fail
+            // MY loser session while the real winner keeps running. Leave the
+            // winner to its own lifecycle; only close my never-dispatched local
+            // session below and return an honest 5xx (a retry resolves via the
+            // winner's own evidence).
+            logger.warn(`[idempotency] barrier-fail release saw the lease change (sameIdentity=${rm.sameIdentity} current rev ${rm.current.revision} state ${rm.current.state} session ${rm.current.sessionId}); not faking a local terminal, leaving the winner`);
           }
           // removed / absent → cleanly released; a same-key retry starts fresh.
         } catch (e) {
@@ -1181,6 +1283,25 @@ export async function triggerSessionTurn(
     // and close — at-most-once, never re-dispatched (finding #5b).
     try {
       beginAsyncTrigger(newDs, triggerId);
+      // Stamp the idempotent-async-turn descriptor so a worker that dies with no
+      // final_output converges to a durable `dispatch_unknown` instead of polling
+      // `running` forever (codex #776 round-6 finding #1). Only for keyed turns:
+      // a non-idempotent async turn has no lease to transition and its
+      // worker-crash semantics are unchanged. The generation is the one this fork
+      // runs on (fork increments from the current max), so the exit handler can
+      // ignore a later generation that already moved on.
+      if (idempotencyKey && idempotencyLease) {
+        const dispatchedGeneration = Math.max(
+          newDs.workerGeneration ?? 0,
+          newDs.session.workerGeneration ?? 0,
+        ) + 1;
+        newDs.idempotentAsyncTurn = {
+          ownerLarkAppId: larkAppId,
+          key: idempotencyKey,
+          triggerId,
+          workerGeneration: dispatchedGeneration,
+        };
+      }
       const dispatchAttempt = prepareStableDispatch(newDs, true);
       armFinalOutputSuppression(newDs, dispatchAttempt);
       forkWorker(newDs, promptInput, dispatchAttempt === undefined

@@ -299,12 +299,19 @@ export function listAllForOwner(
  *  - removed:  on-disk record matched the snapshot and was deleted (converged).
  *  - absent:   nothing on disk (already gone — converged, nothing to do).
  *  - changed:  the record advanced/changed under us (carries the CURRENT record
- *              so the reconcile can RECLASSIFY it by its real state/boot instead
- *              of falsely declaring the sweep converged). */
+ *              so the caller can RECLASSIFY it by its real identity/state/boot
+ *              instead of falsely declaring the sweep converged). `sameIdentity`
+ *              distinguishes "MY exact lease merely advanced its state/revision"
+ *              (e.g. reserved→attempting: a crossed commit-unknown fence I own)
+ *              from "a DIFFERENT winner replaced it" (takeover/re-claim: a new
+ *              session/trigger/boot). The two demand opposite handling — the
+ *              former is a local terminal, the latter must be deferred to the
+ *              actual winner and never faked as a local terminal (codex #776
+ *              round-6 findings #2/#3). */
 export type RemoveByPathResult =
   | { kind: 'removed' }
   | { kind: 'absent' }
-  | { kind: 'changed'; current: IdempotencyRecord };
+  | { kind: 'changed'; current: IdempotencyRecord; sameIdentity: boolean };
 
 /** Reconcile-only compare-and-remove BY PATH (reconcile enumerated the file via
  *  listAllForOwner and holds a snapshot record; the plaintext key isn't
@@ -318,15 +325,20 @@ export type RemoveByPathResult =
  *  tell "converged (removed/absent)" apart from "changed under me" and act on
  *  the latter (finding #2: a bare `false` folded both the changed case AND a
  *  lock-internal corruption into a single value the caller ignored, declaring a
- *  non-convergence a success). A lock-internal re-read corruption or an
- *  ambiguous unlink error THROWS (fail-closed — the reconcile aborts startup
- *  rather than bind while a lease is in an unprovable state). */
+ *  non-convergence a success). The `changed` result carries `sameIdentity` so
+ *  the caller never mistakes a DIFFERENT winner's record for its own advanced
+ *  fence (findings #2/#3). A lock-internal re-read corruption or an ambiguous
+ *  unlink error THROWS (fail-closed — the reconcile aborts startup rather than
+ *  bind while a lease is in an unprovable state). */
 export function compareAndRemoveByPath(fp: string, expect: IdempotencyRecord): RemoveByPathResult {
   return withKeyLock(fp, () => {
     const current = readRecord(fp); // corrupt now → THROWS (never blind-delete, never fold to a success)
     if (!current) return { kind: 'absent' };
     if (current.revision !== expect.revision || current.state !== expect.state || !sameIdentity(current, expect)) {
-      return { kind: 'changed', current }; // advanced/changed under us — hand it back for reclassification
+      // Advanced/changed under us — hand it back for reclassification, marking
+      // whether it is STILL our exact immutable identity (only the mutable
+      // state/revision moved) or a wholly different winner replaced the slot.
+      return { kind: 'changed', current, sameIdentity: sameIdentity(current, expect) };
     }
     strictUnlink(fp); // throws on EIO/EROFS/… (never a silent success)
     return { kind: 'removed' };

@@ -185,7 +185,7 @@ import {
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
 } from './core/session-manager.js';
-import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot } from './core/trigger-session.js';
+import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit } from './core/trigger-session.js';
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
@@ -18930,7 +18930,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         );
       }
     },
-    onWorkerExit(_ds, context) {
+    onWorkerExit(ds, context) {
+      // Converge an incomplete idempotent async turn (options.idempotencyKey):
+      // a worker that died with no final_output would otherwise poll `running`
+      // and let a same-key retry `reuse` the dead session forever, until the next
+      // boot reconcile (codex #776 round-6 finding #1). Best-effort + never throws
+      // into the exit handler; a durable-write failure is left for reconcile.
+      convergeIdempotentAsyncTurnOnWorkerExit(ds, context.workerGeneration);
       const result = handleVcMeetingWorkerGenerationExit(context, {
         dataDir: config.session.dataDir,
         selfAppId: cfg.larkAppId,

@@ -6732,6 +6732,10 @@ function deliverFinalOutput(
     // (with content + usage) after a daemon restart drops the in-memory Map.
     // Stamp the owning bot for cross-bot isolation.
     asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
+    // This idempotent async turn produced its terminal output — clear the
+    // worker-exit convergence stamp so a later graceful exit of this generation
+    // is not retro-failed (codex #776 round-6 finding #1).
+    if (ds.idempotentAsyncTurn?.triggerId === msg.turnId) ds.idempotentAsyncTurn = undefined;
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;

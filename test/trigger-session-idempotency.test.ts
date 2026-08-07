@@ -74,14 +74,22 @@ beforeEach(() => {
   mockCloseSession.mockClear();
 });
 afterEach(() => {
+  vi.restoreAllMocks(); // guarantee any listAllForOwner/etc spy is undone even if an assertion threw
   if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR; else process.env.SESSION_DATA_DIR = prevDataDir;
   rmSync(tempDir, { recursive: true, force: true });
 });
 
 describe('resolveIdempotencyHit (at-most-once decisions)', () => {
   const empty = new Map<string, DaemonSession>();
+  // A genuinely in-flight session: registered AND holding a non-killed worker.
+  // Registry presence alone is NOT liveness (codex #776 round-6 finding #1) —
+  // resolveIdempotencyHit requires a live worker to treat a turn as in-flight.
   const liveFor = (sessionId: string, chatId = 'http_async_x') =>
-    new Map<string, DaemonSession>([['k', { session: { sessionId }, chatId } as any]]);
+    new Map<string, DaemonSession>([['k', { session: { sessionId }, chatId, worker: { killed: false } } as any]]);
+  // Registry-present but worker DEAD (worker exited, ds not yet removed) — the
+  // orphan case that must NOT be treated as in-flight.
+  const deadWorkerFor = (sessionId: string, chatId = 'http_async_x') =>
+    new Map<string, DaemonSession>([['k', { session: { sessionId }, chatId, worker: null } as any]]);
 
   it('completed async result (SAME owner) → reuse (poll it), regardless of lease state', () => {
     asyncTriggerStore.recordCompleted('sess-1', 'trg_1', 'done', 100, OWNER);
@@ -120,6 +128,14 @@ describe('resolveIdempotencyHit (at-most-once decisions)', () => {
     // The reuse-forever codex flagged: a same-boot attempting lease whose session
     // was closed (barrier-fail couldn't delete the fence) must NOT be reused.
     const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-CURRENT' }), 'boot-CURRENT', empty);
+    expect(d.kind).toBe('terminal');
+  });
+
+  it('FINDING #1: attempting + ds STILL REGISTERED but worker=null (dead) → terminal (registry presence ≠ liveness)', () => {
+    // The exact misjudgment: worker exited with no final_output, ds.worker=null but
+    // ds still in activeSessions. Registry presence must NOT count as in-flight, or
+    // trigger-result/retry poll `running`/`reuse` forever.
+    const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-CURRENT' }), 'boot-CURRENT', deadWorkerFor('sess-1'));
     expect(d.kind).toBe('terminal');
   });
 
@@ -267,18 +283,29 @@ describe('reconcileIdempotencyLeasesOnBoot (crash convergence)', () => {
     expect(idempotencyStore.lookup(OWNER, 'k-adv')?.state).toBe('attempting');
   });
 
-  it('FINDING #2: a reserved snapshot whose disk record CHANGED to a foreign-boot reserved (concurrent takeover) fails the reconcile closed', async () => {
-    // If the on-disk lease changed to something we cannot prove converged (a
-    // different reserved revision/boot — e.g. a concurrent takeover), reconcile
-    // must NOT declare success; it throws so startup aborts.
+  it('FINDING #2/#3: a reserved snapshot REPLACED by a different-identity winner → converge OUR orphan, leave the winner (no fake terminal, no throw)', async () => {
+    // The determinism codex reproduced: stale snapshot = sess-cc/reserved; disk was
+    // taken over to a DIFFERENT identity (sess-cc2/boot-OLD2). Reconcile must NOT
+    // fabricate a terminal on the winner (sess-cc2) nor throw — it converges our
+    // never-dispatched orphan (sess-cc) independently and leaves the winner to its
+    // own lease (which this sweep reaches on its own file, or skips if in-flight).
     const { record: reservedSnap } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-cc', triggerId: 'trg_cc', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-cc', now: 1 }) as any;
     const { file } = idempotencyStore.listAllForOwner(OWNER)[0];
-    // Disk advances to a DIFFERENT reserved lease (takeover by another old boot).
+    // Disk advances to a DIFFERENT winner (takeover by another old boot).
     idempotencyStore.takeover({ ownerLarkAppId: OWNER, key: 'k-cc', expect: reservedSnap, sessionId: 'sess-cc2', triggerId: 'trg_cc2', requestHash: 'h', ownerBootId: 'boot-OLD2', now: 6 });
+    sessionRows.set('sess-cc', { sessionId: 'sess-cc', status: 'open' });   // our orphan
+    sessionRows.set('sess-cc2', { sessionId: 'sess-cc2', status: 'open' }); // the winner
     const listSpy = vi.spyOn(idempotencyStore, 'listAllForOwner').mockReturnValue([{ file, record: reservedSnap }]);
 
-    await expect(reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession)).rejects.toThrow();
-    listSpy.mockRestore();
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
+
+    // OUR orphan converged (quarantined + closed); the winner NOT faked terminal.
+    expect(quarantined.has('sess-cc')).toBe(true);
+    expect(mockCloseSession).toHaveBeenCalledWith('sess-cc');
+    expect(asyncTriggerStore.lookup('sess-cc2', 'trg_cc2')).toBeUndefined(); // winner untouched
+    expect(mockCloseSession).not.toHaveBeenCalledWith('sess-cc2');
+    // The winner lease is intact on disk (left to its own lifecycle).
+    expect(idempotencyStore.lookup(OWNER, 'k-cc')?.sessionId).toBe('sess-cc2');
   });
 
   it('FINDING #2: a corrupt OWN lease makes the whole reconcile throw (fail-closed, aborts startup)', async () => {

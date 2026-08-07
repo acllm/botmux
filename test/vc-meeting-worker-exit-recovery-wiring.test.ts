@@ -9,7 +9,7 @@ const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 
 
 describe('VC meeting worker-exit recovery wiring', () => {
   it('arms every exact recovery ref in the onWorkerExit callback', () => {
-    const start = daemonSource.indexOf('onWorkerExit(_ds, context)');
+    const start = daemonSource.indexOf('onWorkerExit(ds, context)');
     const end = daemonSource.indexOf('onReceiverResetReady(_ds, context)', start);
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
@@ -25,7 +25,7 @@ describe('VC meeting worker-exit recovery wiring', () => {
 
   it('does not arm teardown from onCliExit, whose managed CLI exit is already authoritative', () => {
     const start = daemonSource.indexOf('onCliExit(_ds, context)');
-    const end = daemonSource.indexOf('onWorkerExit(_ds, context)', start);
+    const end = daemonSource.indexOf('onWorkerExit(ds, context)', start);
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
     expect(daemonSource.slice(start, end)).not.toContain('vcMeetingRuntimeLeaseRecovery.arm');

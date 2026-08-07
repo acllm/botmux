@@ -173,7 +173,12 @@ describe('reconcile enumeration (owner-partitioned)', () => {
     transition('cli_a', 'k1', record, { state: 'attempting', now: 5000 }); // rev2 attempting
     const stale = compareAndRemoveByPath(file, record); // record is the rev1 reserved snapshot
     expect(stale.kind).toBe('changed');
-    if (stale.kind === 'changed') expect(stale.current.state).toBe('attempting');
+    if (stale.kind === 'changed') {
+      expect(stale.current.state).toBe('attempting');
+      // SAME immutable identity (owner/session/trigger/requestHash/boot), only
+      // state+revision advanced → sameIdentity true (a crossed fence I own).
+      expect(stale.sameIdentity).toBe(true);
+    }
     expect(lookup('cli_a', 'k1')?.state).toBe('attempting'); // fence preserved (codex repro)
     // Exact match → removed.
     const current = lookup('cli_a', 'k1')!;
@@ -181,6 +186,24 @@ describe('reconcile enumeration (owner-partitioned)', () => {
     expect(lookup('cli_a', 'k1')).toBeUndefined();
     // Absent now → absent (not an error, not a phantom removed).
     expect(compareAndRemoveByPath(file, current).kind).toBe('absent');
+  });
+
+  it('compareAndRemoveByPath: a DIFFERENT-identity winner (takeover) → changed + sameIdentity=false', () => {
+    // codex #776 round-6 findings #2/#3: the caller must not mistake a wholly
+    // different winner (new session/trigger/boot via takeover) for its own
+    // advanced fence. sameIdentity=false is the discriminator.
+    const { record: snap } = claim(base({ ownerBootId: 'boot-OLD', sessionId: 'sess-old', triggerId: 'trg-old' })) as { record: IdempotencyRecord };
+    const { file } = listAllForOwner('cli_a')[0];
+    // Takeover replaces the slot with a new session/trigger/boot (same key+hash).
+    takeover({ ownerLarkAppId: 'cli_a', key: 'k1', expect: snap, sessionId: 'sess-new', triggerId: 'trg-new', requestHash: 'sha256:h1', ownerBootId: 'boot-NEW', now: 9000 });
+    const res = compareAndRemoveByPath(file, snap); // snap is the OLD reserved identity
+    expect(res.kind).toBe('changed');
+    if (res.kind === 'changed') {
+      expect(res.sameIdentity).toBe(false);       // different winner, not my advance
+      expect(res.current.sessionId).toBe('sess-new');
+    }
+    // The winner is NOT deleted by the stale snapshot's CAS.
+    expect(lookup('cli_a', 'k1')?.sessionId).toBe('sess-new');
   });
 
   it('compareAndRemoveByPath THROWS on a lock-internal corrupt re-read (never folds to a success)', () => {
@@ -221,6 +244,8 @@ describe('compareAndRemove + weird keys', () => {
     // Stale expectation (wrong revision) → changed (on-disk still the rev1 reserved).
     const stale = compareAndRemove('cli_a', 'k1', { ...record, revision: 99 });
     expect(stale.kind).toBe('changed');
+    // Same immutable identity, only the (stale) revision differs → sameIdentity true.
+    if (stale.kind === 'changed') expect(stale.sameIdentity).toBe(true);
     expect(lookup('cli_a', 'k1')).toBeDefined();
     // Exact match → removed.
     expect(compareAndRemove('cli_a', 'k1', record).kind).toBe('removed');

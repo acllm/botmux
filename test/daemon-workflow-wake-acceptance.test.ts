@@ -31,6 +31,11 @@ function harness() {
     setActiveInteractiveTurn: () => {},
     confirmNativeGroupContextInput: () => {},
     getBot: () => ({ config: { cliId: 'claude-code' } }),
+    // Collaboration stage hand-off (issue #3588): the callback now also marks a
+    // kicked-off stage as running when the CLI takes the turn. These are the
+    // free variables it needs; this test only asserts the workflow-wake side.
+    isSessionGroup: () => false,
+    markCollabStageRunning: async () => undefined,
   };
   const ds = { larkAppId: 'app_main', chatId: 'oc_main', session: { sessionId: 'sess-main', workerGeneration: 2, cliSessionId: 'native-1' } };
   return {

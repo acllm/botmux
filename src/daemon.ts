@@ -1170,6 +1170,8 @@ import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat, listChatMemberDisplays, addUsersToChatByOpenId } from './services/groups-store.js';
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
+import { holdCollabMessageIfNotReady, listCollabResumeCandidates, markCollabStageRunning, reportCollabTurnIfOwned, resumeCollabBootstrap, setCollabSelfAppId, sweepExpiredCollabBootstraps } from './services/collab-birth.js';
+import { reconcileCollabChatIndices } from './services/collab-bootstrap-store.js';
 import { scheduleSessionGroupTitle, subscribeSessionGroupTitles } from './services/session-group-title.js';
 import { hasPendingGroupAutoTitle, scheduleGroupAutoTitle } from './services/group-auto-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
@@ -26923,6 +26925,21 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     if (reborn) return handleNewTopic(data, { ...reborn, sessionGroupQuotaConsumed: true });
   }
 
+  // 协作群初始化门槛（issue #3588）：bootstrap 还没 ready 的群，群内新消息一律
+  // **排队 + 可见提示**，绝不静默丢弃、也绝不让 CLI 抢跑——角色没确认就开工正是
+  // issue 要求堵死的那条路。这里放在斜杠命令之前：连命令都要等（`/close` 之类的
+  // 会话命令在群里有会话后才有意义，而没 ready 的群还没有会话）。
+  // 命中时直接 return：消息已在队列里，ready 之后按序放行。
+  //
+  // 注意这里**刻意不判 `isSessionGroup`**：会话群登记只写在建群那个 bot 的
+  // registry 里，被拉进来的 peer 看不到它。以它为前置条件会让 peer 在角色未确认
+  // 时直接开工——正是 issue 要堵的口子。闸自己按 chatId 查 live journal，owner 与
+  // peer 看到同一个答案；没有任何 bootstrap 时它立刻返回 false，代价是一次内存
+  // 命中的查询。
+  if (chatType === 'group' && scope === 'chat' && !ctx.sessionGroupBirth && !substituteTrigger) {
+    if (await holdCollabMessageIfNotReady({ larkAppId, chatId, messageId, replyRootId })) return;
+  }
+
   // 会话群里登记的会话关闭后，新消息开新会话（与普通群一致）；想接着聊就点关闭卡上的
   // 「恢复会话」，或发 /resume（无会话时由 botmux 认领，见 command-schema）。
 
@@ -34279,6 +34296,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onPromptSubmittedInput(ds, turnId, context) {
       if (ds.session.workerGeneration !== context.workerGeneration) return;
       workflowMainWake.onInputAccepted(ds.session.sessionId, turnId);
+      // Collaboration stage hand-off (issue #3588): the CLI actually took this
+      // turn. That is the bridge between "we posted the kickoff" and "a turn is
+      // executing", and only the latter makes a later terminal meaningful.
+      // NOT gated on isSessionGroup: that registry only exists for the bot
+      // that BIRTHED the group, so an invited peer would never report. The
+      // collab lookup is itself an O(1) no-op for a chat with no bootstrap.
+      void markCollabStageRunning({
+        chatId: ds.chatId,
+        larkAppId: ds.larkAppId,
+        turnId,
+      }).catch(err => logger.warn(`[collab] stage start mark failed: ${err}`));
     },
     async onTurnTerminal(ds, terminal, context) {
       workflowMainWake.onTurnEnded(ds.session.sessionId, terminal.turnId);
@@ -34302,6 +34330,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // Release only the exact XPI shared-cwd admission. Route/principal
       // authority below has its own lifecycle and is deliberately independent.
       onXpiSharedCwdTurnTerminal(ds, terminal, context);
+      // Collaboration-group stage hand-off (issue #3588): a dependent stage may
+      // only start once its upstream's turn actually TERMINALIZED — this is the
+      // evidence the issue demands instead of "the kickoff message was sent".
+      // Fire-and-forget: the resume path is journalled and idempotent, and a
+      // slow role/kickoff round trip must never delay terminal bookkeeping.
+      // Same reason as above: a peer must report too, and it has no
+      // session-group registration. No bootstrap for this chat = immediate no-op.
+      void reportCollabTurnIfOwned({
+        chatId: ds.chatId,
+        larkAppId: ds.larkAppId,
+        turnId: terminal.turnId,
+        status: terminal.status,
+      }).catch(err => logger.warn(`[collab] terminal hand-off failed: ${err}`));
       // VC reconcile first: it is in-memory and latency-sensitive, and must not
       // sit behind a synchronous SQLite write. (Master did only this enqueue.)
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
@@ -35711,6 +35752,37 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Schedule it only after restore populated activeSessions; doing this before
   // the awaited startup I/O deterministically marks every pending record failed.
   scheduleCompletionProposalStartupRecovery(cfg.larkAppId);
+
+  // Collaboration-group bootstrap resume (issue #3588). A bootstrap can be
+  // interrupted at any step by a daemon restart; every step is journalled, and
+  // `chatId` is written before any invite/role/kickoff work, so re-entry reuses
+  // the SAME group and skips finished steps. Run after restore so the roster /
+  // role reads see a settled world, and never block startup on it.
+  if (!cfg.apiOnly) {
+    setCollabSelfAppId(cfg.larkAppId);
+    // Repair per-chat indices from the authoritative journals before any message
+    // can reach the gate: an index lost to a manual delete or a half-written
+    // atomic replace would otherwise let a live journal stop holding its chat.
+    try {
+      const repaired = reconcileCollabChatIndices(config.session.dataDir);
+      if (repaired > 0) logger.info(`[collab] reconciled ${repaired} chat indices`);
+    } catch (err) {
+      logger.warn(`[collab] chat index reconcile failed: ${err}`);
+    }
+    for (const pending of listCollabResumeCandidates()) {
+      void resumeCollabBootstrap(pending).catch(err =>
+        logger.error(`[collab] resume ${pending.requestId} failed: ${err}`));
+    }
+    // A persisted deadline is inert without a clock. This sweep is what turns a
+    // stalled bootstrap (both the started and terminal reports lost) into a
+    // visible failure instead of an "initializing" group that never moves and
+    // keeps holding its messages. 60s granularity: the budgets are minutes.
+    const collabSweep = setInterval(() => {
+      void sweepExpiredCollabBootstraps().catch(err =>
+        logger.warn(`[collab] deadline sweep failed: ${err}`));
+    }, 60_000);
+    collabSweep.unref();
+  }
 
   // Completion Proposal may resume an accepted pending decision immediately.
   // Run only after restore populated activeSessions: running this before the

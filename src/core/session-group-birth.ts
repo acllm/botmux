@@ -42,6 +42,8 @@ import { registerSessionGroup } from '../services/session-groups-store.js';
 import { scheduleSessionGroupTitle } from '../services/session-group-title.js';
 import { tagSessionGroup } from '../services/feed-group-tagger.js';
 import { applySessionGroupAvatar } from '../services/session-group-avatar.js';
+import { birthCollabSessionGroup } from '../services/collab-birth.js';
+import { collabConfigActive } from '../services/collab-group-config.js';
 import { sendMessage, replyMessage, forwardMessage, getMessageDetail } from '../im/lark/client.js';
 import { assertMessageTopicAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { evaluateTalk, extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
@@ -141,6 +143,76 @@ export async function maybeBirthSessionGroup(
 
 
   try {
+    // ─── Collaboration branch (issue #3588) ────────────────────────────────
+    // With an active `sessionGroup.collab` block the group is born with peer
+    // Agents, each one's per-chat role proven applied over the trusted local
+    // IPC channel, and stages started by dependency. Absent/disabled config
+    // falls straight through to the legacy single-bot path below, byte for
+    // byte — that is the compatibility contract, so this branch must stay a
+    // single `if` around a helper rather than a refactor of the legacy flow.
+    if (collabConfigActive(sg.collab)) {
+      await sourceOptions?.beforeWrite();
+      // Register the session group the moment the chat exists — NOT after the
+      // bootstrap returns. For the whole multi-minute initialization the group
+      // is already live in Feishu; registering only at the end leaves a window
+      // where it is not yet a session group, and a message arriving in it walks
+      // straight into the normal CLI path with unconfirmed roles.
+      let registered = false;
+      const registerOnce = (chatId: string): void => {
+        if (registered) return;
+        registered = true;
+        registerSessionGroup(chatId, {
+          autoTitleBaseName: placeholder,
+          ownerOpenId: senderOpenId,
+          lastSessionId: '',
+          originReason: originEv.reason,
+          originQuotaKey: originEv.quotaKey,
+          originChatId: dmChatId,
+        });
+        // Same best-effort branding as the legacy path; a failure here must not
+        // undo a group that already exists.
+        void tagSessionGroup(larkAppId, chatId, senderOpenId);
+        void applySessionGroupAvatar(larkAppId, chatId);
+      };
+      const outcome = await birthCollabSessionGroup({
+        larkAppId,
+        dmChatId,
+        messageId,
+        ownerOpenId: senderOpenId,
+        taskText: trimmed,
+        name: placeholder,
+        ...(workingDir ? { workingDir } : {}),
+        onChatReady: registerOnce,
+      });
+      if (!outcome.chatId) {
+        throw new Error(outcome.failureReason ?? 'collab group was not created');
+      }
+      const collabChatId = outcome.chatId;
+      registerOnce(collabChatId);
+      if (trimmed) scheduleSessionGroupTitle({ larkAppId, chatId: collabChatId, userText: trimmed });
+      logger.info(
+        `[session-group] collab born chat=${collabChatId.substring(0, 12)} req=${outcome.requestId} `
+        + `status=${outcome.status} members=${(sg.collab?.members ?? []).length}`
+        + (outcome.failureReason ? ` reason=${outcome.failureReason}` : ''),
+      );
+      // Only a READY group gets the turn re-homed into it. A failed or
+      // cancelled bootstrap leaves the DM message unanswered in the group —
+      // the progress card and DM receipt already say why, and re-homing would
+      // start a CLI in a group whose roles were never confirmed, which is the
+      // exact "half-ready group starts working" failure the issue forbids.
+      if (outcome.status !== 'ready') return null;
+      return {
+        ...ctx,
+        chatId: collabChatId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: collabChatId,
+        replyAnchorMessageId: undefined,
+        replyRootId: undefined,
+        sessionGroupBirth: true,
+      };
+    }
+
     await sourceOptions?.beforeWrite();
     const result = await createGroupWithBots({
       creatorLarkAppId: larkAppId,

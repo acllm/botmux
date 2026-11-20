@@ -598,7 +598,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
@@ -691,6 +691,25 @@ import { projectCoreOnlyHostFacts } from './core-only-host-facts.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 import { getSessionGroup, isSessionGroup, sessionGroupBoardMeta, type SessionGroupBoardMeta } from '../services/session-groups-store.js';
+import {
+  COLLAB_ROLE_APPLY_ROUTE,
+  COLLAB_ROLE_PROTOCOL,
+  COLLAB_TURN_REPORT_ROUTE,
+  COLLAB_TURN_STARTED_ROUTE,
+  COLLAB_CALLER_APP_HEADER,
+  hashRoleContent,
+  parseCollabRoleApplyRequest,
+  parseCollabTurnReport,
+  parseCollabTurnStartedReport,
+  planCollabRoleApply,
+} from './collab-role-protocol.js';
+import { applyCollabTurnReport, applyCollabTurnStarted } from '../services/collab-birth.js';
+import {
+  collabConfigActive,
+  normalizeCollabConfig,
+  preflightCollabConfig,
+  type CollabPreflightResult,
+} from '../services/collab-group-config.js';
 import {
   commitDeviceIsolationActivation,
   DEVICE_ISOLATION_COMMIT_PATH,
@@ -12100,8 +12119,7 @@ ipcRoute('POST', '/api/oauth-callback', async (req, res) => {
   jsonRes(res, 200, { ok: result.ok, matched: result.matched, message: result.message });
 });
 
-// POST /api/session-group-tag-auth — 生成带 feed-group scope 的授权链接。
-// pending state 由 generateAuthUrl 落盘（~/.botmux/data/oauth-pending/），回调既可
+// POST /api/session-group-tag-auth — 生成带 feed-group scope 的授权链接。// pending state 由 generateAuthUrl 落盘（~/.botmux/data/oauth-pending/），回调既可
 // 经本进程 /api/oauth-callback、也可经 dashboard 的 /api/feed-groups/oauth-callback
 // 跨进程完成换 token（远程浏览器粘贴兜底正依赖这条跨进程路径）。
 ipcRoute('POST', '/api/session-group-tag-auth', requireBoundBot(async (_req, res) => {
@@ -12122,6 +12140,244 @@ ipcRoute('POST', '/api/session-group-tag-auth', requireBoundBot(async (_req, res
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
   }
+}));
+
+// ─── Collaboration-group role readiness (issue #3588) ─────────────────────
+//
+// 私聊专属群拉进来的 peer bot，角色到底有没有应用成功，只有它自己的 daemon 知道。
+// 群里的 `/role profile apply` 只是一条**输入**——发出去了不等于落盘了。所以这里提供
+// 一个受信宿主通道（与 WORKFLOW_HANDOFF_IDENTITY_CHECK_ROUTE 同构的 host-secret 校验），
+// 让发起方的 daemon 直接问接收方的 daemon：按这份 profile 条目写本群 role，然后回报
+// 落盘的 hash；另有 readback 供发起方复核「写完之后有没有被人改」。
+//
+// 设计见 docs/design/2026-11-20-dm-collab-group-bootstrap.md §4.3。
+// 三条不变量：
+//   1. entry 缺失 → 明确失败，**绝不回落默认角色**继续开工；
+//   2. entry 内容与调用方期望的 hash 不符 → 明确失败（过期请求不能开工）；
+//   3. 本群已有不同的 role → 默认拒绝（人可能是故意设的），只有 force 才覆盖。
+ipcRoute('POST', COLLAB_ROLE_APPLY_ROUTE, requireBoundBot(async (req, res) => {
+  // Trusted-host only: loopback is connectivity, not identity (see daemon-ipc-auth).
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, reason: 'trusted_host_required' });
+  const body = await readJsonBodyOrBadJson<Record<string, unknown>>(req, res, 16 * 1024);
+  if (body === BAD_JSON) return;
+
+  // `op: 'readback'` is the second half of readiness: after a peer wrote the
+  // role, the caller re-asks what is on disk NOW. Same route so both halves
+  // share one auth surface and one protocol version.
+  if (body.op === 'readback') {
+    const chatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
+    const profileId = typeof body.profileId === 'string' ? body.profileId.trim() : '';
+    if (!isValidRoleChatId(chatId)) return jsonRes(res, 200, { ok: false, reason: 'invalid_chat_id' });
+    if (!isValidRoleProfileId(profileId)) return jsonRes(res, 200, { ok: false, reason: 'invalid_profile_id' });
+    jsonRes(res, 200, {
+      ok: true,
+      protocol: COLLAB_ROLE_PROTOCOL,
+      chatId,
+      chatRoleHash: hashRoleContent(resolveRoleFile(cachedLarkAppId, chatId)),
+      entryHash: hashRoleContent(readRoleProfileEntry(config.session.dataDir, profileId, cachedLarkAppId)),
+    });
+    return;
+  }
+
+  const request = parseCollabRoleApplyRequest({ ...body, protocol: body.protocol });
+  if (!request) return jsonRes(res, 200, { ok: false, reason: 'invalid_request' });
+  if (!isValidRoleChatId(request.chatId)) {
+    return jsonRes(res, 200, { ok: false, reason: 'invalid_chat_id' });
+  }
+  if (!isValidRoleProfileId(request.profileId)) {
+    return jsonRes(res, 200, { ok: false, reason: 'invalid_profile_id' });
+  }
+
+  try {
+    const entryContent = readRoleProfileEntry(config.session.dataDir, request.profileId, cachedLarkAppId);
+    const chatRoleContent = resolveRoleFile(cachedLarkAppId, request.chatId);
+    const plan = planCollabRoleApply({
+      entryContent,
+      chatRoleContent,
+      expectedHash: request.expectedHash,
+      force: request.force,
+    });
+    if (plan.action === 'refuse') {
+      logger.info(
+        `[collab] role apply refused chat=${request.chatId.substring(0, 12)} app=${cachedLarkAppId} `
+        + `reason=${plan.reason} req=${request.requestId}`,
+      );
+      return jsonRes(res, 200, {
+        ok: false,
+        reason: plan.reason,
+        ...(plan.actualHash ? { actualHash: plan.actualHash } : {}),
+      });
+    }
+
+    let changed = false;
+    if (plan.action === 'write') {
+      // Re-read immediately before the write so the conflict decision and the
+      // write see the same state. A role file written between the two reads
+      // would otherwise be silently replaced without a conflict report.
+      const stillSame = resolveRoleFile(cachedLarkAppId, request.chatId) === chatRoleContent;
+      if (!stillSame && !request.force) {
+        return jsonRes(res, 200, {
+          ok: false,
+          reason: 'chat_role_conflict',
+          ...(hashRoleContent(resolveRoleFile(cachedLarkAppId, request.chatId))
+            ? { actualHash: hashRoleContent(resolveRoleFile(cachedLarkAppId, request.chatId))! }
+            : {}),
+        });
+      }
+      writeRoleFile(cachedLarkAppId, request.chatId, entryContent!);
+      changed = true;
+    }
+
+    // Report what is ACTUALLY on disk, not what we meant to write: the receipt
+    // is the readiness proof, so it must be read back after the write.
+    const appliedHash = hashRoleContent(resolveRoleFile(cachedLarkAppId, request.chatId));
+    if (appliedHash !== request.expectedHash) {
+      return jsonRes(res, 200, {
+        ok: false,
+        reason: 'applied_hash_mismatch',
+        ...(appliedHash ? { actualHash: appliedHash } : {}),
+      });
+    }
+    logger.info(
+      `[collab] role applied chat=${request.chatId.substring(0, 12)} app=${cachedLarkAppId} `
+      + `profile=${request.profileId} changed=${changed} req=${request.requestId}`,
+    );
+    jsonRes(res, 200, {
+      ok: true,
+      protocol: COLLAB_ROLE_PROTOCOL,
+      requestId: request.requestId,
+      configFingerprint: request.configFingerprint,
+      chatId: request.chatId,
+      appliedHash,
+      appliedAt: Date.now(),
+      changed,
+      overwrote: plan.action === 'write' && plan.overwrote,
+    });
+  } catch (error: unknown) {
+    jsonRes(res, 500, { ok: false, reason: 'internal_error', message: String(error) });
+  }
+}));
+
+// ─── Collaboration-group configuration (issue #3588) ──────────────────────
+//
+// 配置面。读返回「原始配置 + 预检结果」，写走与其他 sessionGroup 字段同一条
+// rmwBotEntry 通道（bots.json + 热更内存），所以不存在「页面存了、daemon 还读旧的」。
+//
+// 预检刻意放在**服务端**：它要读本机 bots.json（哪些 bot 真的存在、是不是 apiOnly）、
+// 本机 daemon 心跳（谁在线）、以及 profile 目录（谁的条目齐）。这些 dashboard 进程
+// 拿不到，只能由各 daemon 自己答。
+
+function collabPreflightFor(selfLarkAppId: string, collab: unknown): CollabPreflightResult {
+  const known = loadBotConfigsCached().map(c => ({
+    larkAppId: c.larkAppId,
+    ...(c.apiOnly ? { apiOnly: true } : {}),
+    ...(c.displayName ? { displayName: c.displayName } : {}),
+  }));
+  const online = new Set(listOnlineDaemons(config.session.dataDir).map(d => d.larkAppId));
+  const profileId = (collab as any)?.profileId;
+  const entries = typeof profileId === 'string' && isValidRoleProfileId(profileId)
+    ? new Set(listRoleProfileEntries(config.session.dataDir, profileId).map(e => e.larkAppId))
+    : new Set<string>();
+  return preflightCollabConfig({
+    collab: collab as any,
+    selfLarkAppId,
+    knownBots: known,
+    onlineBots: online,
+    profileEntries: entries,
+  });
+}
+
+ipcRoute('GET', '/api/session-group-collab-config', requireBoundBot(async (_req, res) => {
+  const raw = getBot(cachedLarkAppId).config.sessionGroup?.collab;
+  jsonRes(res, 200, {
+    ok: true,
+    enabled: collabConfigActive(raw),
+    config: raw ?? {},
+    preflight: collabPreflightFor(cachedLarkAppId, raw),
+  });
+}));
+
+ipcRoute('PUT', '/api/session-group-collab-config', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson<{ collab?: unknown }>(req, res, 64 * 1024);
+  if (body === BAD_JSON) return;
+  // Normalize FIRST: a config the birth path would reject must never reach
+  // bots.json. The page shows the preflight of what was actually stored, so a
+  // save that "succeeded" can never leave the daemon unable to start a group.
+  let normalized;
+  try {
+    normalized = normalizeCollabConfig(body.collab, { selfLarkAppId: cachedLarkAppId });
+  } catch (error) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'invalid_collab_config',
+      message: String((error as Error)?.message ?? error),
+    });
+  }
+  try {
+    const bot = getBot(cachedLarkAppId);
+    const r = await rmwBotEntry(cachedLarkAppId, (entry: any) => {
+      if (!entry.sessionGroup || typeof entry.sessionGroup !== 'object') entry.sessionGroup = {};
+      if (normalized) entry.sessionGroup.collab = normalized;
+      else delete entry.sessionGroup.collab;
+      return { write: true, result: normalized };
+    });
+    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    bot.config.sessionGroup = { ...(bot.config.sessionGroup ?? {}), collab: normalized };
+    jsonRes(res, 200, {
+      ok: true,
+      enabled: collabConfigActive(normalized),
+      config: normalized ?? {},
+      preflight: collabPreflightFor(cachedLarkAppId, normalized),
+    });
+  } catch (error: unknown) {
+    jsonRes(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}));
+
+// POST /api/collab/turn-started — peer daemon → owner daemon.
+//
+// 与 turn-report 同构、同一鉴权面：peer 的 CLI 真正接走那一轮时上报，owner 把该
+// stage 从 `sent` 推到 `running`。缺了这一步，peer stage 永远停在 `sent`，而
+// terminal 只结算 `running`，于是它的下游永远不启动。
+ipcRoute('POST', COLLAB_TURN_STARTED_ROUTE, requireBoundBot(async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, reason: 'trusted_host_required' });
+  const body = await readJsonBodyOrBadJson<Record<string, unknown>>(req, res, 8 * 1024);
+  if (body === BAD_JSON) return;
+  const report = parseCollabTurnStartedReport(body);
+  if (!report) return jsonRes(res, 200, { ok: false, reason: 'invalid_request' });
+  // The shared host secret proves "a trusted process on this machine", not
+  // "the bot this report names". Require the caller's own id (a separate
+  // header, populated from ITS config) to match the member it reports for —
+  // otherwise any daemon on the host could forge a member's progress and
+  // release a downstream stage early.
+  const caller = String(req.headers[COLLAB_CALLER_APP_HEADER] ?? '').trim();
+  if (!caller || caller !== report.larkAppId) {
+    logger.warn(`[collab] turn-started rejected: caller=${caller || '-'} claims=${report.larkAppId}`);
+    return jsonRes(res, 403, { ok: false, reason: 'caller_identity_mismatch' });
+  }
+  const outcome = await applyCollabTurnStarted(cachedLarkAppId, report);
+  jsonRes(res, 200, outcome);
+}));
+
+// POST /api/collab/turn-report — peer daemon → owner daemon.
+//
+// 协作群里被 @ 起来的那一轮跑完了，这件事发生在 **peer 的** daemon 里，而 journal
+// 在 owner 这里。没有这条回报，owner 只能靠「消息顺序 / 屏幕 / 耗时」去猜上游是否完成，
+// 而 issue 明确把这三种都排除掉了。回报带 requestId + chatId + larkAppId，owner 只推进
+// 自己 journal 里对得上的那一格，所以迟到/伪造/串群的回报都落不了地。
+ipcRoute('POST', COLLAB_TURN_REPORT_ROUTE, requireBoundBot(async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, reason: 'trusted_host_required' });
+  const body = await readJsonBodyOrBadJson<Record<string, unknown>>(req, res, 8 * 1024);
+  if (body === BAD_JSON) return;
+  const report = parseCollabTurnReport(body);
+  if (!report) return jsonRes(res, 200, { ok: false, reason: 'invalid_request' });
+  const caller = String(req.headers[COLLAB_CALLER_APP_HEADER] ?? '').trim();
+  if (!caller || caller !== report.larkAppId) {
+    logger.warn(`[collab] turn-report rejected: caller=${caller || '-'} claims=${report.larkAppId}`);
+    return jsonRes(res, 403, { ok: false, reason: 'caller_identity_mismatch' });
+  }
+  const outcome = await applyCollabTurnReport(cachedLarkAppId, report);
+  jsonRes(res, 200, outcome);
 }));
 
 // GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）+ 标签名。

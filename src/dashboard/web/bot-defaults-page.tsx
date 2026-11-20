@@ -4,6 +4,7 @@ import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../
 import type { OncallGroupBusinessTarget } from '../../services/oncall-group-client.js';
 import type { OncallGroupPolicy } from '../../services/oncall-group-policy.js';
 import { SessionGroupNamingRow } from './session-group-naming-row.js';
+import { SessionGroupCollabRow } from './session-group-collab-row.js';
 import { DEFAULT_LONG_TASK_REMINDER, normalizeLongTaskReminderConfig } from '../../services/long-task-reminder-policy.js';
 import { FeedbackExtensionPanel } from './feedback-extension-panel.js';
 import { CodexProfilePicker } from './codex-profile-picker.js';
@@ -783,6 +784,23 @@ export function BotDefaultsPage() {
   // larkAppId → 关联的 Agent 名称；只用于提示条，加载失败时静默为空。
   const [linkedAgentNames, setLinkedAgentNames] = useState<Record<string, AgentLockInfo>>({});
   const [profileRoleVersion, setProfileRoleVersion] = useState(0);
+  // Role profile ids for the collaboration editor. Fetched once per page mount:
+  // the picker must offer the profiles that actually exist on this machine, not
+  // a free-text field the user can typo into a config the daemon rejects.
+  const [roleProfileIds, setRoleProfileIds] = useState<string[]>([]);
+  useEffect(() => {
+    let active = true;
+    void fetch('/api/role-profiles').then(async r => {
+      const body = await r.json().catch(() => ({}));
+      if (!active || !r.ok) return;
+      const profiles = Array.isArray(body.profiles) ? body.profiles : [];
+      setRoleProfileIds(profiles
+        .map((p: any) => String(p?.profileId ?? ''))
+        .filter((id: string) => id.length > 0)
+        .sort());
+    }).catch(() => { /* the picker degrades to "未选择" */ });
+    return () => { active = false; };
+  }, [profileRoleVersion]);
   const [, setAvatarVersion] = useState(0);
   const [onboardingBusy, setOnboardingBusy] = useState(false);
   // `#/bot-defaults?tab=<分类>&section=<区块>&field=<配置项>`（⌘K 全局搜索）：落在该分类 / 区块 /
@@ -909,6 +927,7 @@ export function BotDefaultsPage() {
         key={`${selectedBot.larkAppId}:${profileRoleVersion}`}
         bot={selectedBot}
         bots={bots}
+        roleProfileIds={roleProfileIds}
         cliState={cliState}
         patchBot={patchBot}
         refreshBot={() => { void refresh(); }}
@@ -1063,6 +1082,8 @@ export function OncallChatCounts(props: { bot: Pick<BotDefaultsRow, 'autoboundCh
 function BotDefaultsCard(props: {
   bot: BotDefaultsRow;
   bots: BotDefaultsRow[];
+  /** Role profile ids available to the collaboration editor. */
+  roleProfileIds?: string[];
   cliState: CliOptionsState;
   patchBot: PatchBot;
   refreshBot?(): void;
@@ -1158,7 +1179,7 @@ function BotDefaultsCard(props: {
         </LazyTabPanel>
         <LazyTabPanel id="sessions" active={props.activeTab === 'sessions'}>
           <BdTabGrid>
-            <section className="bd-tile" id={botDefaultsSectionDomId('session-mode')}><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('session-mode')}><SessionModeSection bot={bot} bots={props.bots} roleProfileIds={props.roleProfileIds ?? []} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('steward')}><StewardSection bot={bot} patchBot={patchBot} active={props.activeTab === 'sessions'} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('substitute')}><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('command-trigger')}><CommandTriggerSection bot={bot} /></section>
@@ -7154,6 +7175,8 @@ function summaryRange(bot: BotDefaultsRow): { limit: number; sinceHours: number 
 
 function SessionModeSection(props: {
   bot: BotDefaultsRow;
+  bots: BotDefaultsRow[];
+  roleProfileIds: string[];
   patchBot: PatchBot;
   putCardPref(patch: CardPrefPatch): Promise<JsonResponse>;
 }) {
@@ -7317,6 +7340,12 @@ function SessionModeSection(props: {
         {p2p === 'group' ? (
           <>
             <SessionGroupNamingRow key={props.bot.larkAppId} appId={props.bot.larkAppId} cliId={props.bot.cliId} />
+            <SessionGroupCollabRow
+              key={`collab-${props.bot.larkAppId}`}
+              appId={props.bot.larkAppId}
+              bots={props.bots.map(b => ({ larkAppId: b.larkAppId, name: b.displayName || b.larkAppId }))}
+              profiles={props.roleProfileIds ?? []}
+            />
             <SessionGroupTagRow bot={props.bot} />
             <p className="bd-section-note" data-session-group-lifecycle>{tr('botDefaults.sgLifecycleHint')}</p>
           </>

@@ -1,4 +1,5 @@
 import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
+import { normalizeCollabConfig } from './services/collab-group-config.js';
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
 import { normalizeMessageListenerReplyMode } from './services/message-listener-reply-policy.js';
 import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
@@ -1388,11 +1389,92 @@ export interface VcMeetingRealtimeVoiceConfig {
 }
 
 /**
+ * One Agent's slot in a DM-born collaboration group (issue #3588).
+ *
+ * Addressed by `larkAppId` — a display name can be renamed or duplicated, so it
+ * is never an identity. `stage` / `role` are free-form labels used for the
+ * progress card and logs; `role` also selects which entry of the referenced
+ * role profile this bot materializes as its per-chat role.
+ */
+export interface CollabMemberConfig {
+  larkAppId: string;
+  /** Human-facing slot name shown on the progress card (`builder`, `reviewer`…). */
+  stage?: string;
+  /**
+   * Role label for this member inside the group's profile. Today every member
+   * materializes ITS OWN entry of the profile, so this is documentation and
+   * card text rather than a selector — it exists so a future profile layout
+   * with several roles per bot has a place to grow into.
+   */
+  role?: string;
+  /**
+   * First-round prompt. `{task}` is replaced with the DM task text; `{upstream}`
+   * with a short summary of this member's upstream stages. An empty prompt means
+   * "join the group and apply the role, but do not start a turn".
+   */
+  prompt?: string;
+  /**
+   * Members whose START must have COMPLETED before this one is kicked off.
+   * Completion is proven by that member's turn terminal, never by "the kickoff
+   * message was sent" — see docs/design/2026-11-20-dm-collab-group-bootstrap.md §4.4.
+   */
+  dependsOn?: string[];
+}
+
+/**
+ * Opt-in collaboration bootstrap for DM-born session groups (issue #3588).
+ *
+ * Absent or `enabled: false` ⟹ `maybeBirthSessionGroup` takes its legacy path
+ * byte for byte: one invited bot, one intro, one receipt.
+ */
+export interface CollabGroupConfig {
+  enabled?: boolean;
+  /** Reusable role suite (`role-profiles/<profileId>/<larkAppId>.md`). */
+  profileId?: string;
+  /**
+   * Peer Agents pulled into every DM-born group. The birthing bot is implicit
+   * and must NOT be listed here.
+   */
+  members?: CollabMemberConfig[];
+  /**
+   * 'staged' (default) starts members by `dependsOn`; 'all' kicks every member
+   * off as soon as all roles are confirmed, ignoring the dependency edges.
+   */
+  startPolicy?: 'staged' | 'all';
+  /** Per-member readiness budget in ms (default 180000). */
+  onInitTimeoutMs?: number;
+}
+
+/**
+ * Load-time normalization for `sessionGroup`.
+ *
+ * `collab` is the only field that can make the birth path take a different
+ * branch, so it is the only one that gets validated here rather than being cast
+ * through. An INVALID block is dropped (with a warning) instead of throwing:
+ * one bad hand-edited block must not take a bot's whole daemon down, and
+ * dropping it degrades to the legacy single-bot behaviour the operator already
+ * knows — the opposite of silently running a half-configured collaboration.
+ */
+function normalizeSessionGroupEntry(raw: unknown, larkAppId: string): SessionGroupConfig {
+  const entry = raw as SessionGroupConfig;
+  if (entry.collab === undefined) return entry;
+  try {
+    const collab = normalizeCollabConfig(entry.collab, { selfLarkAppId: larkAppId });
+    return { ...entry, ...(collab ? { collab } : { collab: undefined }) };
+  } catch (error) {
+    logger.warn(`[${larkAppId}] sessionGroup.collab ignored (invalid): ${(error as Error)?.message ?? error}`);
+    return { ...entry, collab: undefined };
+  }
+}
+
+/**
  * Per-bot settings for p2pMode='group' session groups (each top-level DM
  * message births a dedicated 1-user+1-bot group hosting the conversation).
  * Everything is optional; effective defaults in parentheses.
  */
 export interface SessionGroupConfig {
+  /** Opt-in multi-Agent collaboration bootstrap (issue #3588). */
+  collab?: CollabGroupConfig;
   /** Group-name generation. */
   naming?: {
     /**
@@ -4641,7 +4723,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // normalizes to undefined so bots.json stays clean.
       p2pMode: entry.p2pMode === 'thread' ? 'thread' : entry.p2pMode === 'group' ? 'group' : undefined,
       sessionGroup: entry.sessionGroup && typeof entry.sessionGroup === 'object'
-        ? entry.sessionGroup as SessionGroupConfig
+        ? normalizeSessionGroupEntry(entry.sessionGroup, entry.larkAppId)
         : undefined,
       noCardChats: Array.isArray(entry.noCardChats)
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())

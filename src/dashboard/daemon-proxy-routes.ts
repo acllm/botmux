@@ -196,6 +196,18 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
     method: 'PUT', path: botPath('session-group-naming-config'),
     upstream: '/api/session-group-naming-config', body: RAW,
   },
+  // collaboration-group (issue #3588): `{ collab }` — the peer roster, profile
+  // and per-Agent start policy. The daemon normalizes before persisting, so an
+  // invalid block never reaches bots.json.
+  {
+    method: 'GET', path: botPath('session-group-collab-config'),
+    upstream: '/api/session-group-collab-config', body: { kind: 'none' },
+  },
+  {
+    method: 'PUT', path: botPath('session-group-collab-config'),
+    upstream: '/api/session-group-collab-config',
+    body: { kind: 'json', maxBytes: 64 * 1024 },
+  },
   // p2p-mode：`{ p2pMode: 'chat'|'thread'|'group' }`（其余值清回扁平连续 chat 默认）。
   putBotConfig('p2p-mode'),
   // envelope-injection：`{ envelopeInjection: 'auto'|'off'|'' }`（#794：hook 注入 per-turn 上下文）。

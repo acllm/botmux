@@ -51,6 +51,17 @@ export interface CollabMemberJournal {
     kickoffMessageId?: string;
     /** In-flight send claim; expires so a crashed send is retried. */
     claim?: { at: number; ttlMs: number };
+    /**
+     * A terminal that arrived BEFORE we knew this stage's turnId.
+     *
+     * started and terminal are two independent IPC calls and can be reordered
+     * in flight; a short turn can finish before its own "started" report lands.
+     * At that moment the stage is `sent` with no turnId, so the fail-closed
+     * identity check has nothing to match against — and dropping the terminal
+     * loses the only proof the stage ever finished. Buffer it here and let the
+     * later "started" report settle it.
+     */
+    pendingTerminal?: { turnId: string; status: 'completed' | 'failed' | 'cancelled' | 'ambiguous'; at: number };
   };
 }
 
@@ -333,6 +344,18 @@ function parseJournal(raw: unknown): CollabBootstrapJournal | null {
         ...(typeof startState.kickoffMessageId === 'string' ? { kickoffMessageId: startState.kickoffMessageId } : {}),
         ...(isRecord(startState.claim) && typeof startState.claim.at === 'number' && typeof startState.claim.ttlMs === 'number'
           ? { claim: { at: startState.claim.at, ttlMs: startState.claim.ttlMs } }
+          : {}),
+        ...(isRecord(startState.pendingTerminal)
+          && typeof startState.pendingTerminal.turnId === 'string'
+          && typeof startState.pendingTerminal.at === 'number'
+          && ['completed', 'failed', 'cancelled', 'ambiguous'].includes(startState.pendingTerminal.status as string)
+          ? {
+            pendingTerminal: {
+              turnId: startState.pendingTerminal.turnId,
+              status: startState.pendingTerminal.status as 'completed' | 'failed' | 'cancelled' | 'ambiguous',
+              at: startState.pendingTerminal.at,
+            },
+          }
           : {}),
       },
     };

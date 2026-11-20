@@ -498,22 +498,24 @@ describe('applyCollabTurnTerminal', () => {
     expect(j.members[BUILDER].start.state).toBe('completed');
   });
 
-  it('settles a `sent` stage when the terminal carries the matching turnId', () => {
-    // started and terminal are independent IPC calls and can arrive out of
-    // order: a short turn can finish before its own "started" report lands.
-    // Rejecting it would strand the stage with its completion evidence already
-    // discarded. The identity check (turnId on BOTH sides) is what keeps this
-    // safe, not the step state.
+  it('buffers (not settles) a terminal for a `sent` stage — see the reordering cases', () => {
+    // A `sent` stage has no turnId yet, so there is nothing to verify the
+    // terminal against. It is HELD, then settled when the started report
+    // supplies the id. Settling immediately would accept an identity we never
+    // checked; dropping it would lose the completion proof.
     const j = startedJournal();
     expect(applyCollabTurnTerminal(j, { larkAppId: BUILDER, turnId: 'turn-1', status: 'completed' }))
-      .toEqual({ changed: true, state: 'completed' });
+      .toEqual({ changed: true });
+    expect(j.members[BUILDER].start.state).toBe('sent');
+    expect(j.members[BUILDER].start.pendingTerminal).toMatchObject({ turnId: 'turn-1' });
   });
 
-  it('still refuses a `sent` stage whose terminal names another turn', () => {
+  it('keeps the first buffered terminal when a second turn reports too', () => {
     const j = startedJournal();
+    applyCollabTurnTerminal(j, { larkAppId: BUILDER, turnId: 'turn-1', status: 'completed' });
     expect(applyCollabTurnTerminal(j, { larkAppId: BUILDER, turnId: 'turn-9', status: 'completed' }))
       .toEqual({ changed: false });
-    expect(j.members[BUILDER].start.state).toBe('sent');
+    expect(j.members[BUILDER].start.pendingTerminal).toMatchObject({ turnId: 'turn-1' });
   });
 
   it('ignores a terminal from a different turn', () => {
@@ -882,5 +884,66 @@ describe('long turns, grants and working-dir bindings', () => {
     expect(outcome.status).toBe('failed');
     expect(outcome.failureReason).toBe('collaboration_grants_failed');
     expect(h.kicks).toEqual([]);
+  });
+});
+
+describe('started / terminal reordering', () => {
+  function sentJournal(): CollabBootstrapJournal {
+    const j = journalFor(config());
+    j.chatId = CHAT;
+    j.status = 'running';
+    j.members[BUILDER].join = { state: 'joined' };
+    j.members[BUILDER].role = { state: 'confirmed' };
+    j.members[BUILDER].start = { state: 'sent', kickoffMessageId: 'om_kick' };
+    return j;
+  }
+
+  it('buffers a terminal that arrives BEFORE the started report', () => {
+    // A short turn can finish before its own "started" report lands. At that
+    // moment the stage is `sent` with no turnId, so the fail-closed identity
+    // check has nothing to match — dropping the terminal would lose the only
+    // proof the stage ever finished.
+    const j = sentJournal();
+    expect(applyCollabTurnTerminal(j, { larkAppId: BUILDER, turnId: 'turn-1', status: 'completed' }))
+      .toEqual({ changed: true });
+    expect(j.members[BUILDER].start.pendingTerminal).toMatchObject({ turnId: 'turn-1', status: 'completed' });
+    expect(j.members[BUILDER].start.state).toBe('sent');
+  });
+
+  it('settles from the buffer when the started report finally arrives', () => {
+    const j = sentJournal();
+    applyCollabTurnTerminal(j, { larkAppId: BUILDER, turnId: 'turn-1', status: 'completed' });
+    expect(markCollabStageRunning(j, { larkAppId: BUILDER, turnId: 'turn-1' })).toEqual({ changed: true });
+    expect(j.members[BUILDER].start.state).toBe('completed');
+    expect(j.members[BUILDER].start.pendingTerminal).toBeUndefined();
+  });
+
+  it('does not settle from a buffered terminal belonging to another turn', () => {
+    const j = sentJournal();
+    applyCollabTurnTerminal(j, { larkAppId: BUILDER, turnId: 'turn-9', status: 'completed' });
+    markCollabStageRunning(j, { larkAppId: BUILDER, turnId: 'turn-1' });
+    // Still running: the real terminal for turn-1 has not been seen.
+    expect(j.members[BUILDER].start.state).toBe('running');
+  });
+
+  it('settles the normal in-order delivery too', () => {
+    const j = sentJournal();
+    markCollabStageRunning(j, { larkAppId: BUILDER, turnId: 'turn-1' });
+    expect(applyCollabTurnTerminal(j, { larkAppId: BUILDER, turnId: 'turn-1', status: 'completed' }))
+      .toEqual({ changed: true, state: 'completed' });
+  });
+
+  it('records a buffered FAILED terminal as failed, not completed', () => {
+    const j = sentJournal();
+    applyCollabTurnTerminal(j, { larkAppId: BUILDER, turnId: 'turn-1', status: 'failed' });
+    markCollabStageRunning(j, { larkAppId: BUILDER, turnId: 'turn-1' });
+    expect(j.members[BUILDER].start.state).toBe('failed');
+  });
+
+  it('ignores a terminal with no turnId at all while still `sent`', () => {
+    const j = sentJournal();
+    expect(applyCollabTurnTerminal(j, { larkAppId: BUILDER, status: 'completed' }))
+      .toEqual({ changed: false });
+    expect(j.members[BUILDER].start.pendingTerminal).toBeUndefined();
   });
 });

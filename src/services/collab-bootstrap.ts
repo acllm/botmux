@@ -934,6 +934,7 @@ export function markCollabStageRunning(
   // the transition but keep the stage uncorrelated, so `applyCollabTurnTerminal`
   // refuses to settle it (see the fail-closed rule there) instead of letting any
   // completed turn in the same chat stand in for it.
+  const pending = slot.start.pendingTerminal;
   // Spread the existing step so `kickoffMessageId` (and any future field)
   // survives the transition; only the state and the correlation id change.
   slot.start = {
@@ -942,6 +943,16 @@ export function markCollabStageRunning(
     ...(input.turnId ? { turnId: input.turnId } : {}),
   };
   delete slot.start.claim;
+  if (pending && input.turnId && pending.turnId === input.turnId) {
+    // The terminal already arrived for THIS turn (reordered delivery). Settle
+    // immediately instead of waiting for a second report that will never come.
+    slot.start = {
+      ...slot.start,
+      state: pending.status === 'completed' ? 'completed' : 'failed',
+      ...(pending.status !== 'completed' ? { error: pending.status } : {}),
+    };
+    delete slot.start.pendingTerminal;
+  }
   return { changed: true };
 }
 
@@ -961,7 +972,27 @@ export function applyCollabTurnTerminal(
   // Safety is unchanged: the turnId must still match BOTH sides (below), so an
   // unrelated turn in the same chat cannot settle this stage — the only thing
   // that relaxes is WHICH step state may be settled, not the identity check.
-  if (slot.start.state !== 'running' && slot.start.state !== 'sent') return { changed: false };
+  if (slot.start.state === 'sent') {
+    // Reordering case: the terminal beat the started report, so this stage has
+    // no turnId yet. Buffer the terminal instead of dropping it — the later
+    // "started" report (or the next resume) settles it from here. Dropping it
+    // was a real stall: the stage stays `sent`, `markCollabStageRunning` moves
+    // it to `running`, and the completion proof is already gone.
+    if (!input.turnId) return { changed: false };
+    const held = slot.start.pendingTerminal;
+    if (held && held.turnId !== input.turnId) {
+      // A DIFFERENT turn already finished here. Keep the first one: it is the
+      // one whose started report we are still waiting for.
+      return { changed: false };
+    }
+    if (held && held.status === input.status) return { changed: false };
+    slot.start = {
+      ...slot.start,
+      pendingTerminal: { turnId: input.turnId, status: input.status, at: Date.now() },
+    };
+    return { changed: true };
+  }
+  if (slot.start.state !== 'running') return { changed: false };
   // FAIL CLOSED on identity. A terminal may only settle the stage it belongs to,
   // and the only evidence of "belongs to" is a matching turnId on BOTH sides.
   // Accepting a missing id would let any completed turn from the same bot in the
